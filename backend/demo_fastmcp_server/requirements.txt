@@ -1,0 +1,7 @@
+# requirements.txt
+# Pin to minimum versions; adjust upward as needed.
+fastmcp>=2.11.0
+PyJWT>=2.8.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+python-dotenv>=1.0.0

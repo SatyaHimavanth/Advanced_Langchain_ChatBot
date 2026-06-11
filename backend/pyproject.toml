@@ -1,0 +1,54 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Advanced Langchain ChatBot"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ddgs>=9.14.4",
+    "deepagents>=0.6.8",
+    "duckduckgo-search>=8.1.1",
+    "fastapi>=0.136.3",
+    "langchain>=1.3.4",
+    "langchain-community>=0.4.2",
+    "langchain-openai>=1.2.2",
+    "langgraph-supervisor>=0.0.31",
+    "passlib[bcrypt]>=1.7.4",
+    "pyjwt>=2.13.0",
+    "python-dotenv>=1.2.2",
+    "sqlalchemy>=2.0.50",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[project.optional-dependencies]
+langgraph-checkpoint-sqlite = [
+    "langgraph-checkpoint-sqlite>=3.1.0",
+]
+langgraph-checkpoint-postgres = [
+    "langgraph>=1.2.4",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "psycopg[binary,pool]>=3.3.4",
+]
+langchain-azure-cosmosdb = [
+    "langchain-azure-cosmosdb>=1.0.0",
+]
+langgraph-checkpoint-mongodb = [
+    "langgraph>=1.2.4",
+    "langgraph-checkpoint-mongodb>=0.4.0",
+    "pymongo>=4.16.0",
+]
+langgraph-checkpoint-redis = [
+    "langgraph>=1.2.4",
+    "langgraph-checkpoint-redis>=0.4.1",
+]
+langgraph-oracledb = [
+    "langgraph>=1.2.4",
+    "langgraph-oracledb>=1.0.1",
+]
+fastmcp-server = [
+    "fastmcp>=3.4.2",
+    "httpx>=0.28.1",
+    "pyjwt>=2.13.0",
+    "python-dotenv>=1.2.2",
+    "uvicorn[standard]>=0.49.0",
+]
