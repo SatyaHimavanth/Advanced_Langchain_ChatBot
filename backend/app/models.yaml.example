@@ -1,0 +1,25 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# models.yaml — Available LLM Models Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file defines all models available to users. Admin can edit via UI or
+# directly modify this file (auto-reloaded on change).
+#
+# Structure:
+#   tiers:
+#     free: [model_ids...]      # Models that don't consume token quota
+#     paid: [model_ids...]      # Models that consume token quota
+#
+#   models:
+#     model_id:
+#       name: Display name
+#       provider: cisco | openai | anthropic | custom
+#       deployment: Azure deployment name (if applicable)
+#       description: Short description
+#       context_window: Max context tokens
+#       max_output: Max output tokens
+#       supports_reasoning: true/false (for o1-style models)
+#       supports_vision: true/false
+#       enabled: true/false
+#
+#   default_model: model_id to use when user hasn't selected one
+# ═══════════════════════════════════════════════════════════════════════════════

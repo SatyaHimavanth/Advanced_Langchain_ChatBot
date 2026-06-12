@@ -1,124 +1,36 @@
-from uuid import uuid4
+"""
+Entry point for the Advanced LangChain ChatBot backend.
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+Run with:   python main.py     (or: uv run main.py)
 
-from agents.coding_agent.agent import (
-    coding_agent,
-)
-from agents.utils.streaming import (
-    InterruptAction,
-    build_agent_input,
-    stream_agent_sse,
-)
-from agent_contexts import Context
+On Windows the asyncio event-loop MUST be a SelectorEventLoop, because
+psycopg's async mode is incompatible with the default ProactorEventLoop.
+We set the policy AND drive uvicorn's server coroutine inside a loop we create
+ourselves (via asyncio.run), so uvicorn cannot fall back to a Proactor loop.
+"""
 
+import asyncio
+import sys
 
-app = FastAPI(
-    title="LangChain Chat API",
-    version="1.0.0",
-)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-# ============================================================
-# CORS
-# ============================================================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================
-# Request Model
-# ============================================================
-
-class ChatRequest(BaseModel):
-
-    thread_id: str | None = None
-
-    user_name: str = "Anonymous"
-
-    message: str | None = None
-
-    interrupt_action: (
-        InterruptAction | None
-    ) = None
-
-
-# ============================================================
-# Health
-# ============================================================
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# ============================================================
-# Chat
-# ============================================================
-
-@app.post("/chat")
-async def chat(
-    request: ChatRequest,
-):
-
-    thread_id = (
-        request.thread_id
-        or str(uuid4())
-    )
-
-    config = {
-        "configurable": {
-            "thread_id": thread_id,
-        }
-    }
-
-    context = Context(
-        user_name=request.user_name,
-    )
-
-    agent_input = build_agent_input(
-        message=request.message,
-        interrupt_action=request.interrupt_action,
-    )
-
-    return StreamingResponse(
-        stream_agent_sse(
-            agent=coding_agent,
-            input=agent_input,
-            config=config,
-            context=context,
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-# ============================================================
-# Run
-# ============================================================
-
-if __name__ == "__main__":
-
+def run() -> None:
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
+    config = uvicorn.Config(
+        "app.server:app",
         host="0.0.0.0",
         port=8000,
+        # Use plain asyncio (not uvloop/auto) so the loop we create below is used.
+        loop="asyncio",
     )
+    server = uvicorn.Server(config)
+    # asyncio.run() builds a fresh loop from the policy set above (Selector on
+    # Windows) and runs uvicorn inside it.
+    asyncio.run(server.serve())
+
+
+if __name__ == "__main__":
+    run()

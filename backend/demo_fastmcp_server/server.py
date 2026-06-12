@@ -23,6 +23,9 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -30,6 +33,7 @@ from starlette.responses import JSONResponse
 from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext
 from fastmcp.exceptions import ResourceError, ToolError
+from fastmcp.prompts.prompt import Message
 from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
 from fastmcp.server.middleware.logging import StructuredLoggingMiddleware
 from fastmcp.server.middleware.rate_limiting import SlidingWindowRateLimitingMiddleware
@@ -758,7 +762,7 @@ async def prompt_summarize_tasks(
         list[str],
         "Status filters to include. Example: ['todo', 'in_progress']",
     ] = ["todo", "in_progress"],  # noqa: B006
-) -> list[dict[str, str]]:
+) -> list[Message]:
     """
     Builds a multi-turn prompt asking the LLM to summarise and prioritise
     tasks that match the requested statuses.
@@ -778,9 +782,8 @@ async def prompt_summarize_tasks(
         )
 
     return [
-        {
-            "role": "user",
-            "content": (
+        Message(
+            content=(
                 "Please summarise and prioritise the following tasks:\n\n"
                 f"{task_block}\n\n"
                 "Structure your response as:\n"
@@ -789,7 +792,8 @@ async def prompt_summarize_tasks(
                 "3. **Blocked or At-Risk Items** (if any)\n"
                 "4. **Recommended Next Actions**"
             ),
-        }
+            role="user",
+        )
     ]
 
 
@@ -805,7 +809,7 @@ def prompt_code_review(
         str,
         "Review focus: security | performance | readability | all",
     ] = "all",
-) -> list[dict[str, str]]:
+) -> list[Message]:
     """
     Returns a two-message prompt (system + user) for a focused code review.
 
@@ -819,17 +823,19 @@ def prompt_code_review(
         "all":         "Cover security, performance, readability, correctness, and best practices comprehensively.",
     }.get(focus, "Cover all aspects of code quality.")
 
+    # MCP PromptMessage only allows user|assistant roles; fold the reviewer
+    # persona/instructions into a leading assistant turn followed by the
+    # user request so both the role-setting and the task survive the wire.
     return [
-        {
-            "role": "system",
-            "content": (
+        Message(
+            content=(
                 f"You are an expert {language} code reviewer. {instructions} "
                 "Be specific, actionable, and cite line-level examples where possible."
             ),
-        },
-        {
-            "role": "user",
-            "content": (
+            role="assistant",
+        ),
+        Message(
+            content=(
                 f"Review the following {language} code:\n\n"
                 f"```{language.lower()}\n{code}\n```\n\n"
                 "Provide:\n"
@@ -838,7 +844,8 @@ def prompt_code_review(
                 "3. **Specific Improvements** (with corrected code where useful)\n"
                 "4. **Verdict**: Approve / Request Changes / Block"
             ),
-        },
+            role="user",
+        ),
     ]
 
 
@@ -851,7 +858,7 @@ def prompt_debug_request(
     error_message: Annotated[str,       "The error message or exception text"],
     context:       Annotated[str,       "What you were doing when the error occurred"],
     code_snippet:  Annotated[str | None,"Relevant code snippet (optional)"] = None,
-) -> list[dict[str, str]]:
+) -> list[Message]:
     """
     Returns a single-user-message prompt that guides the LLM through
     structured root-cause analysis and a step-by-step fix.
@@ -860,9 +867,8 @@ def prompt_debug_request(
         f"\n\nRelevant code:\n```\n{code_snippet}\n```" if code_snippet else ""
     )
     return [
-        {
-            "role": "user",
-            "content": (
+        Message(
+            content=(
                 "I encountered an error and need debugging help.\n\n"
                 f"**Error:**\n{error_message}\n\n"
                 f"**What I was doing:**\n{context}"
@@ -873,7 +879,8 @@ def prompt_debug_request(
                 "3. **Provide** a step-by-step fix with code\n"
                 "4. **Suggest** how to prevent this class of error in future"
             ),
-        }
+            role="user",
+        )
     ]
 
 
