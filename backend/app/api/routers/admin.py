@@ -16,7 +16,7 @@ ADMIN_PASSWORD in .env on first startup.
 from datetime import datetime, timezone, timedelta
 from typing import Any, Generic, List, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func as sql_func, desc, extract
 from sqlalchemy.orm import Session
@@ -92,13 +92,13 @@ class UserResponse(BaseModel):
 class UserCreateRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
-    role: str = Field("user", pattern="^(user|admin)$")
+    role: str = Field("user", pattern="^(user|admin|disabled)$")
     is_approved: bool = True
     token_quota: int = Field(default_factory=lambda: settings.DEFAULT_TOKEN_QUOTA)
 
 
 class UserUpdateRequest(BaseModel):
-    role: str | None = Field(None, pattern="^(pending|user|admin)$")
+    role: str | None = Field(None, pattern="^(pending|user|admin|disabled)$")
     is_approved: bool | None = None
     token_quota: int | None = Field(None, ge=-1)  # -1 = unlimited
     reset_usage: bool = False  # If true, reset tokens_used_this_month to 0
@@ -106,6 +106,10 @@ class UserUpdateRequest(BaseModel):
 
 class QuotaIncreaseRequest(BaseModel):
     additional_tokens: int = Field(..., gt=0)
+
+
+class UserApprovalRequest(BaseModel):
+    role: str = Field("user", pattern="^(user|admin)$")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -169,7 +173,17 @@ class ModelConfigUpdateRequest(BaseModel):
 class ModelEntryRequest(BaseModel):
     name: str
     provider: str
+    model: str | None = None
     deployment: str | None = None
+    azure_deployment: str | None = None
+    endpoint: str | None = None
+    azure_endpoint: str | None = None
+    base_url: str | None = None
+    api_version: str | None = None
+    api_key_env: str | None = None
+    api_key: str | None = None
+    organization: str | None = None
+    temperature: float | None = None
     description: str = ""
     context_window: int = 128000
     max_output: int = 16384
@@ -177,6 +191,12 @@ class ModelEntryRequest(BaseModel):
     supports_vision: bool = False
     enabled: bool = True
     is_free: bool = False
+
+
+def _clear_agent_cache(request: Request) -> None:
+    """Clear cached per-model agents after model config changes."""
+    if hasattr(request.app.state, "agent_cache"):
+        request.app.state.agent_cache = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -300,8 +320,8 @@ def create_user(
         username=req.username,
         hashed_password=hashed_password,
         role=req.role,
-        is_approved=req.is_approved,
-        token_quota=req.token_quota,
+        is_approved=False if req.role == "disabled" else req.is_approved,
+        token_quota=-1 if req.role == "admin" else req.token_quota,
         tokens_used_this_month=0,
     )
     db.add(new_user)
@@ -370,18 +390,34 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
+    previous_role = user.role
     if req.role is not None:
         user.role = req.role
+        if req.role in {"user", "admin"}:
+            user.is_approved = True
+        elif req.role in {"pending", "disabled"}:
+            user.is_approved = False
+        if req.role == "admin":
+            user.token_quota = -1
+        elif previous_role == "admin" and req.role == "user" and user.token_quota == -1:
+            user.token_quota = settings.DEFAULT_TOKEN_QUOTA
     if req.is_approved is not None:
         user.is_approved = req.is_approved
         # When approving, also set role to 'user' if still 'pending'
         if req.is_approved and user.role == "pending":
             user.role = "user"
+        if not req.is_approved and user.role in {"user", "admin"}:
+            user.role = "pending"
     if req.token_quota is not None:
         user.token_quota = req.token_quota
     if req.reset_usage:
         user.tokens_used_this_month = 0
         user.quota_reset_date = datetime.now(timezone.utc)
+    if user.role == "disabled":
+        user.is_approved = False
+    elif user.role == "admin":
+        user.is_approved = True
+        user.token_quota = -1
     
     db.commit()
     db.refresh(user)
@@ -414,21 +450,32 @@ def update_user(
 @router.post("/users/{user_id}/approve")
 def approve_user(
     user_id: int,
+    req: UserApprovalRequest,
     db: Session = Depends(database.get_db),
     admin: models.User = Depends(require_admin),
 ):
-    """Approve a pending user registration."""
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    """Approve a pending registration with user or admin access."""
+    user = db.query(models.User).filter(
+        models.User.id == user_id,
+        models.User.role == "pending",
+        models.User.is_approved == False,
+    ).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Pending user not found")
     
     user.is_approved = True
-    if user.role == "pending":
-        user.role = "user"
+    user.role = req.role
+    if req.role == "admin":
+        user.token_quota = -1
     db.commit()
     
-    logger.info("Admin %s approved user %s", admin.username, user.username)
-    return {"status": "success", "message": f"User {user.username} approved"}
+    logger.info("Admin %s approved user %s as %s", admin.username, user.username, req.role)
+    return {
+        "status": "success",
+        "message": f"User {user.username} approved as {req.role}",
+        "role": req.role,
+        "token_quota": user.token_quota,
+    }
 
 
 @router.post("/users/{user_id}/reject")
@@ -667,6 +714,7 @@ def get_models_config(
 @router.put("/models", response_model=ModelConfigResponse)
 def update_models_config(
     req: ModelConfigUpdateRequest,
+    request: Request,
     admin: models.User = Depends(require_admin),
 ):
     """Update the models configuration (full or partial)."""
@@ -680,6 +728,7 @@ def update_models_config(
         config["models"] = req.models
     
     models_config.save_config(config)
+    _clear_agent_cache(request)
     logger.info("Admin %s updated models config", admin.username)
     
     return ModelConfigResponse(
@@ -693,6 +742,7 @@ def update_models_config(
 def add_or_update_model(
     model_id: str,
     req: ModelEntryRequest,
+    request: Request,
     admin: models.User = Depends(require_admin),
 ):
     """Add or update a single model entry."""
@@ -706,7 +756,17 @@ def add_or_update_model(
     config["models"][model_id] = {
         "name": req.name,
         "provider": req.provider,
+        "model": req.model or model_id,
         "deployment": req.deployment,
+        "azure_deployment": req.azure_deployment or req.deployment,
+        "endpoint": req.endpoint,
+        "azure_endpoint": req.azure_endpoint or req.endpoint,
+        "base_url": req.base_url,
+        "api_version": req.api_version,
+        "api_key_env": req.api_key_env,
+        "api_key": req.api_key,
+        "organization": req.organization,
+        "temperature": req.temperature,
         "description": req.description,
         "context_window": req.context_window,
         "max_output": req.max_output,
@@ -730,6 +790,7 @@ def add_or_update_model(
     config["tiers"]["paid"] = list(paid_models)
     
     models_config.save_config(config)
+    _clear_agent_cache(request)
     logger.info("Admin %s added/updated model %s", admin.username, model_id)
     
     return {"status": "success", "model_id": model_id}
@@ -738,6 +799,7 @@ def add_or_update_model(
 @router.delete("/models/{model_id}")
 def delete_model(
     model_id: str,
+    request: Request,
     admin: models.User = Depends(require_admin),
 ):
     """Delete a model from the configuration."""
@@ -755,6 +817,7 @@ def delete_model(
                 tier.remove(model_id)
     
     models_config.save_config(config)
+    _clear_agent_cache(request)
     logger.info("Admin %s deleted model %s", admin.username, model_id)
     
     return {"status": "success", "deleted": model_id}
@@ -762,10 +825,12 @@ def delete_model(
 
 @router.post("/models/reload")
 def reload_models_config(
+    request: Request,
     admin: models.User = Depends(require_admin),
 ):
     """Force reload models configuration from disk."""
     config = models_config.reload_config()
+    _clear_agent_cache(request)
     logger.info("Admin %s reloaded models config", admin.username)
     return {
         "status": "success",

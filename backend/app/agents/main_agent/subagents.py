@@ -12,13 +12,23 @@ and returns a consolidated report, keeping the main agent's context clean.
 """
 
 from langchain.chat_models import BaseChatModel
+from langchain.agents.middleware import ModelFallbackMiddleware
 
 from app.agents.main_agent.tools import web_search
 from app.agents.weather_agent.tools import get_weather
 
 
-def create_subagents(*, llm: BaseChatModel) -> list[dict]:
+def create_subagents(
+    *,
+    llm: BaseChatModel,
+    fallback_llm: BaseChatModel | None = None,
+) -> list[dict]:
     """Build the list of subagent specs for SubAgentMiddleware."""
+    fallback_middleware = (
+        [ModelFallbackMiddleware(fallback_llm)]
+        if fallback_llm is not None
+        else []
+    )
     return [
         {
             "name": "websearch",
@@ -33,7 +43,7 @@ def create_subagents(*, llm: BaseChatModel) -> list[dict]:
             ),
             "tools": [web_search],
             "model": llm,
-            "middleware": [],
+            "middleware": list(fallback_middleware),
         },
         {
             "name": "weather",
@@ -47,7 +57,7 @@ def create_subagents(*, llm: BaseChatModel) -> list[dict]:
             ),
             "tools": [get_weather],
             "model": llm,
-            "middleware": [],
+            "middleware": list(fallback_middleware),
         },
         {
             "name": "explorer",
@@ -65,6 +75,6 @@ def create_subagents(*, llm: BaseChatModel) -> list[dict]:
             ),
             "tools": [web_search],
             "model": llm,
-            "middleware": [],
+            "middleware": list(fallback_middleware),
         },
     ]

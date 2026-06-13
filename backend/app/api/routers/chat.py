@@ -28,6 +28,8 @@ from app.db import database, models
 from app.db.database import SessionLocal
 from app.core import auth
 from app.agents.shared.agent_contexts import Context
+from app.agents.main_agent.agent import create_main_agent
+from app.agents.shared.llms import get_llm
 from app.agents.shared.streaming import (
     InterruptAction,
     build_agent_input,
@@ -59,6 +61,70 @@ class ChatRequest(BaseModel):
     interrupt_action: InterruptAction | None = None
     # Model to use for this request; omit to use the default model.
     model_id: str | None = None
+
+
+async def _get_agent_for_model(request: Request, model_id: str):
+    cache = getattr(request.app.state, "agent_cache", None)
+    if cache is None:
+        cache = {}
+        request.app.state.agent_cache = cache
+
+    cache_key = model_id or None
+    if cache_key in cache:
+        return cache[cache_key]
+
+    default_model_id = models_config.get_default_model()
+    fallback_llm = get_llm(default_model_id) if model_id != default_model_id else None
+
+    async def build_agent(target_model_id: str, target_fallback_llm=None):
+        return await create_main_agent(
+            llm=get_llm(target_model_id),
+            fallback_llm=target_fallback_llm,
+            context_schema=Context,
+            store=getattr(request.app.state, "store", None),
+            checkpointer=getattr(request.app.state, "checkpointer", None),
+        )
+
+    lock = getattr(request.app.state, "agent_cache_lock", None)
+    if lock is None:
+        try:
+            agent = await build_agent(model_id, fallback_llm)
+        except Exception:
+            if model_id == default_model_id:
+                raise
+            logger.exception(
+                "Failed to build selected model '%s'; using default '%s'",
+                model_id,
+                default_model_id,
+            )
+            agent = cache.get(default_model_id)
+            if agent is None:
+                agent = await build_agent(default_model_id)
+                cache[default_model_id] = agent
+            return agent
+        cache[cache_key] = agent
+        return agent
+
+    async with lock:
+        if cache_key in cache:
+            return cache[cache_key]
+        try:
+            agent = await build_agent(model_id, fallback_llm)
+        except Exception:
+            if model_id == default_model_id:
+                raise
+            logger.exception(
+                "Failed to build selected model '%s'; using default '%s'",
+                model_id,
+                default_model_id,
+            )
+            agent = cache.get(default_model_id)
+            if agent is None:
+                agent = await build_agent(default_model_id)
+                cache[default_model_id] = agent
+            return agent
+        cache[cache_key] = agent
+        return agent
 
 
 def _check_quota(user: models.User, model_id: str | None) -> None:
@@ -117,10 +183,6 @@ async def chat(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    agent = getattr(request.app.state, "agent", None)
-    if agent is None:
-        raise HTTPException(status_code=503, detail="Agent is not ready")
-
     if not req.message and req.interrupt_action is None:
         raise HTTPException(
             status_code=400,
@@ -132,14 +194,16 @@ async def chat(
     model_info = models_config.get_model_info(model_id)
     if not model_info or not model_info.enabled:
         raise HTTPException(status_code=400, detail=f"Model '{model_id}' is not available")
+
+    agent = await _get_agent_for_model(request, model_id)
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent is not ready")
     
     # ── Check and reset quota ───────────────────────────────────────────────
     _reset_monthly_quota_if_needed(current_user, db)
     _check_quota(current_user, model_id)
     
     user_id = current_user.id
-    is_free_model = models_config.is_free_model(model_id)
-
     # ── Resolve or create the conversation ──────────────────────────────────
     if req.history_id is not None:
         history = (
@@ -213,6 +277,8 @@ async def chat(
         reasoning_tokens = token_usage.get("reasoning_tokens", 0) if token_usage else 0
         total_tokens = token_usage.get("total_tokens", 0) if token_usage else 0
         model_name = token_usage.get("model_name", model_id) if token_usage else model_id
+        used_model_id = models_config.resolve_model_id(model_name, model_id)
+        is_free_model = models_config.is_free_model(used_model_id)
         
         with SessionLocal() as session:
             # Save the assistant message with token data

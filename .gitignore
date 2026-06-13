@@ -1,0 +1,15 @@
+.agents/
+.env
+.env.*
+!.env.example
+backend/.env
+backend/app/models.yaml
+backend/agent.db
+backend/workspace/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+skills-lock.json

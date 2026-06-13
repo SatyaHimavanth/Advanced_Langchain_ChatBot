@@ -1,25 +1,58 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# models.yaml — Available LLM Models Configuration
-# ═══════════════════════════════════════════════════════════════════════════════
-# This file defines all models available to users. Admin can edit via UI or
-# directly modify this file (auto-reloaded on change).
-#
-# Structure:
-#   tiers:
-#     free: [model_ids...]      # Models that don't consume token quota
-#     paid: [model_ids...]      # Models that consume token quota
-#
-#   models:
-#     model_id:
-#       name: Display name
-#       provider: cisco | openai | anthropic | custom
-#       deployment: Azure deployment name (if applicable)
-#       description: Short description
-#       context_window: Max context tokens
-#       max_output: Max output tokens
-#       supports_reasoning: true/false (for o1-style models)
-#       supports_vision: true/false
-#       enabled: true/false
-#
-#   default_model: model_id to use when user hasn't selected one
-# ═══════════════════════════════════════════════════════════════════════════════
+# Copy this file to models.yaml, then fill credentials and Azure deployment
+# details for your subscription.
+
+default_model: azure-gpt-4.1
+
+tiers:
+  free:
+    - azure-gpt-5.4-mini
+  paid:
+    - azure-gpt-4.1
+    - openai-gpt-5.5
+
+models:
+  azure-gpt-4.1:
+    name: Azure GPT-4.1
+    provider: azure_openai
+    model: gpt-4.1
+    deployment: gpt-4.1
+    endpoint: ""
+    api_version: ""
+    api_key_env: ""
+    api_key: ""
+    description: General-purpose Azure model for coding, analysis, and tool use
+    context_window: 1047576
+    max_output: 32768
+    supports_reasoning: false
+    supports_vision: true
+    enabled: true
+
+  azure-gpt-5.4-mini:
+    name: Azure GPT-5.4 Mini
+    provider: azure_openai
+    model: gpt-5.4-mini
+    deployment: gpt-5.4-mini
+    endpoint: ""
+    api_version: ""
+    api_key_env: ""
+    api_key: ""
+    description: Fast reasoning model for coding, computer use, and subagents
+    context_window: 400000
+    max_output: 128000
+    supports_reasoning: true
+    supports_vision: true
+    enabled: true
+
+  openai-gpt-5.5:
+    name: OpenAI GPT-5.5
+    provider: openai
+    model: gpt-5.5
+    base_url: ""
+    api_key_env: ""
+    api_key: ""
+    description: OpenAI frontier model for complex professional and agentic work
+    context_window: 1050000
+    max_output: 128000
+    supports_reasoning: true
+    supports_vision: true
+    enabled: true

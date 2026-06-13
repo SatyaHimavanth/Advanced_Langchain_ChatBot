@@ -29,6 +29,7 @@ from langchain.agents.middleware import (
     TodoListMiddleware,
     ToolRetryMiddleware,
     ModelRetryMiddleware,
+    ModelFallbackMiddleware,
     ContextEditingMiddleware,
     ClearToolUsesEdit,
     HostExecutionPolicy,
@@ -103,6 +104,7 @@ def create_middlewares(
     *,
     backend_factory: CompositeBackend,
     llm: BaseChatModel,
+    fallback_llm: BaseChatModel | None = None,
     store=None,
 ):
     logger.info("Creating main-agent middleware stack.")
@@ -110,6 +112,7 @@ def create_middlewares(
     mcp_mw, mcp_extra_tools = _try_create_mcp_middleware()
 
     middlewares = [
+        *([ModelFallbackMiddleware(fallback_llm)] if fallback_llm is not None else []),
         # ── Reliability ──────────────────────────────────────────────────
         ModelRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
         ToolRetryMiddleware(max_retries=3, backoff_factor=2.0, initial_delay=1.0),
@@ -194,7 +197,7 @@ def create_middlewares(
         # ── Subagents for info gathering / exploration ───────────────────
         SubAgentMiddleware(
             backend=backend_factory,
-            subagents=create_subagents(llm=llm),
+            subagents=create_subagents(llm=llm, fallback_llm=fallback_llm),
         ),
     ]
 

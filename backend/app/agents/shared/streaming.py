@@ -412,19 +412,13 @@ def _handle_updates_chunk(
             continue
         if msg.content and not msg.tool_calls:
             rmeta   = msg.response_metadata or {}
-            usage   = rmeta.get("token_usage", {})
+            usage   = _normalize_usage(msg, rmeta)
             latency = rmeta.get("latency_checkpoint", {})
             events.append(("agent_message", {
                 "agent":   agent,
                 "content": msg.content,
-                "model":   rmeta.get("model_name", ""),
-                "tokens": {
-                    "input":  usage.get("prompt_tokens", 0),
-                    "output": usage.get("completion_tokens", 0),
-                    "total":  usage.get("total_tokens", 0),
-                    "cached": usage.get("prompt_tokens_details", {})
-                                   .get("cached_tokens", 0),
-                },
+                "model":   rmeta.get("model_name") or rmeta.get("model") or "",
+                "tokens": usage,
                 "latency_ms": {
                     "ttft":  latency.get("user_visible_ttft_ms", 0),
                     "total": latency.get("total_duration_ms", 0),
@@ -434,6 +428,60 @@ def _handle_updates_chunk(
             }))
 
     return events
+
+
+def _nested_get(data: dict, path: tuple[str, ...], default: int = 0) -> int:
+    cur: Any = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if isinstance(cur, int) else default
+
+
+def _normalize_usage(msg: AIMessage, response_metadata: dict) -> dict:
+    """Normalize token usage across LangChain and provider metadata shapes."""
+    usage_metadata = getattr(msg, "usage_metadata", None) or {}
+    token_usage = response_metadata.get("token_usage") or {}
+
+    input_tokens = (
+        usage_metadata.get("input_tokens")
+        or token_usage.get("prompt_tokens")
+        or token_usage.get("input_tokens")
+        or 0
+    )
+    output_tokens = (
+        usage_metadata.get("output_tokens")
+        or token_usage.get("completion_tokens")
+        or token_usage.get("output_tokens")
+        or 0
+    )
+    total_tokens = (
+        usage_metadata.get("total_tokens")
+        or token_usage.get("total_tokens")
+        or (input_tokens + output_tokens)
+    )
+    reasoning_tokens = (
+        _nested_get(usage_metadata, ("output_token_details", "reasoning"))
+        or _nested_get(usage_metadata, ("output_token_details", "reasoning_tokens"))
+        or _nested_get(token_usage, ("completion_tokens_details", "reasoning_tokens"))
+        or token_usage.get("reasoning_tokens")
+        or 0
+    )
+    cached_tokens = (
+        _nested_get(usage_metadata, ("input_token_details", "cache_read"))
+        or _nested_get(usage_metadata, ("input_token_details", "cached_tokens"))
+        or _nested_get(token_usage, ("prompt_tokens_details", "cached_tokens"))
+        or 0
+    )
+
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "reasoning": reasoning_tokens,
+        "total": total_tokens,
+        "cached": cached_tokens,
+    }
 
 
 # ── Custom stream parser ──────────────────────────────────────────────────────
@@ -645,7 +693,7 @@ class _EventCollector:
 
     def get_token_usage(self) -> dict:
         """Return accumulated token usage from all agent_message events."""
-        total = self._total_input_tokens + self._total_output_tokens + self._total_reasoning_tokens
+        total = self._total_input_tokens + self._total_output_tokens
         return {
             "input_tokens": self._total_input_tokens,
             "output_tokens": self._total_output_tokens,
@@ -846,7 +894,6 @@ async def _agent_generator(
                     await result
             except Exception:
                 logger.exception("on_complete callback failed for thread %s", thread_id)
-        yield _sse("done", {"thread_id": thread_id})
         yield _sse("done", {"thread_id": thread_id})
 
 

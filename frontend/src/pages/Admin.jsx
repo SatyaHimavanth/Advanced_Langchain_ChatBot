@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../components/AuthContext';
 import {
@@ -26,7 +26,7 @@ function Admin() {
     const [usersOffset, setUsersOffset] = useState(0);
     const [hasMoreUsers, setHasMoreUsers] = useState(true);
     const [userFilter, setUserFilter] = useState('all'); // all | pending | approved
-    const [selectedUser, setSelectedUser] = useState(null);
+    const [pendingApprovalRoles, setPendingApprovalRoles] = useState({});
     const [editingQuota, setEditingQuota] = useState(null);
     const [quotaAmount, setQuotaAmount] = useState('');
     
@@ -113,9 +113,19 @@ function Admin() {
     };
 
     const approveUser = async (userId) => {
+        const role = pendingApprovalRoles[userId] || 'user';
         try {
-            const res = await apiFetch(`/admin/users/${userId}/approve`, { method: 'POST' });
+            const res = await apiFetch(`/admin/users/${userId}/approve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role }),
+            });
             if (res.ok) {
+                setPendingApprovalRoles(prev => {
+                    const next = { ...prev };
+                    delete next[userId];
+                    return next;
+                });
                 fetchPendingUsers();
                 fetchUsers(0, true);
             }
@@ -174,10 +184,13 @@ function Admin() {
 
     const updateUserRole = async (userId, newRole) => {
         try {
+            const body = { role: newRole };
+            if (newRole === 'disabled') body.is_approved = false;
+            if (newRole === 'user' || newRole === 'admin') body.is_approved = true;
             const res = await apiFetch(`/admin/users/${userId}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ role: newRole }),
+                body: JSON.stringify(body),
             });
             if (res.ok) {
                 fetchUsers(0, true);
@@ -348,6 +361,11 @@ function Admin() {
         return new Date(dateStr).toLocaleDateString();
     };
 
+    const getUserStatus = (user) => {
+        if (user.role === 'disabled') return 'Disabled';
+        return user.is_approved ? 'Approved' : 'Pending';
+    };
+
     // ═══════════════════════════════════════════════════════════════════════════════
     // Render
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -402,23 +420,50 @@ function Admin() {
                         {pendingUsers.length > 0 && (
                             <div className="pending-section">
                                 <h3>Pending Approvals ({pendingUsers.length})</h3>
-                                <div className="pending-list">
-                                    {pendingUsers.map(user => (
-                                        <div key={user.id} className="pending-card">
-                                            <div className="pending-info">
-                                                <strong>{user.username}</strong>
-                                                <span className="pending-date">Registered: {formatDate(user.created_at)}</span>
-                                            </div>
-                                            <div className="pending-actions">
-                                                <button className="btn-approve" onClick={() => approveUser(user.id)}>
-                                                    <Check size={16} /> Approve
-                                                </button>
-                                                <button className="btn-reject" onClick={() => rejectUser(user.id)}>
-                                                    <X size={16} /> Reject
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ))}
+                                <div className="data-table pending-table">
+                                    <table>
+                                        <thead>
+                                            <tr>
+                                                <th>Username</th>
+                                                <th>Registered</th>
+                                                <th>Grant Access</th>
+                                                <th>Quota</th>
+                                                <th>Decision</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {pendingUsers.map(user => (
+                                                <tr key={user.id}>
+                                                    <td><strong>{user.username}</strong></td>
+                                                    <td>{formatDate(user.created_at)}</td>
+                                                    <td>
+                                                        <select
+                                                            className="role-select"
+                                                            value={pendingApprovalRoles[user.id] || 'user'}
+                                                            onChange={(e) => setPendingApprovalRoles(prev => ({
+                                                                ...prev,
+                                                                [user.id]: e.target.value,
+                                                            }))}
+                                                        >
+                                                            <option value="user">User</option>
+                                                            <option value="admin">Admin</option>
+                                                        </select>
+                                                    </td>
+                                                    <td>{user.token_quota === -1 ? 'Unlimited' : formatNumber(user.token_quota)}</td>
+                                                    <td>
+                                                        <div className="pending-actions">
+                                                            <button className="btn-approve" onClick={() => approveUser(user.id)}>
+                                                                <Check size={16} /> Approve
+                                                            </button>
+                                                            <button className="btn-reject" onClick={() => rejectUser(user.id)}>
+                                                                <X size={16} /> Reject
+                                                            </button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
                                 </div>
                             </div>
                         )}
@@ -462,11 +507,12 @@ function Admin() {
                                                     <option value="pending">Pending</option>
                                                     <option value="user">User</option>
                                                     <option value="admin">Admin</option>
+                                                    <option value="disabled">Disabled</option>
                                                 </select>
                                             </td>
                                             <td>
-                                                <span className={`status-badge ${user.is_approved ? 'approved' : 'pending'}`}>
-                                                    {user.is_approved ? 'Approved' : 'Pending'}
+                                                <span className={`status-badge ${user.role === 'disabled' ? 'disabled' : user.is_approved ? 'approved' : 'pending'}`}>
+                                                    {getUserStatus(user)}
                                                 </span>
                                             </td>
                                             <td>
@@ -631,7 +677,12 @@ function Admin() {
                                     id: '',
                                     name: '',
                                     provider: 'azure',
+                                    model: '',
                                     deployment: '',
+                                    azure_deployment: '',
+                                    endpoint: '',
+                                    api_version: '',
+                                    api_key_env: '',
                                     description: '',
                                     context_window: 128000,
                                     max_output: 16384,
@@ -670,6 +721,14 @@ function Admin() {
                                                 <p>{model.description || 'No description'}</p>
                                                 <div className="model-specs">
                                                     <span>Provider: {model.provider}</span>
+                                                    {(model.model || model.deployment) && (
+                                                        <span>Model: {model.model || model.deployment}</span>
+                                                    )}
+                                                    {model.deployment && <span>Deployment: {model.deployment}</span>}
+                                                    {(model.endpoint || model.azure_endpoint || model.base_url) && (
+                                                        <span>Endpoint configured</span>
+                                                    )}
+                                                    {model.api_key_env && <span>Key: {model.api_key_env}</span>}
                                                     <span>Context: {formatNumber(model.context_window)}</span>
                                                     {model.supports_reasoning && <span>🧠 Reasoning</span>}
                                                     {model.supports_vision && <span>👁️ Vision</span>}
@@ -722,7 +781,13 @@ function ModelForm({ model, isNew, onSave, onCancel }) {
         id: model.id || '',
         name: model.name || '',
         provider: model.provider || 'azure',
+        model: model.model || '',
         deployment: model.deployment || '',
+        azure_deployment: model.azure_deployment || model.deployment || '',
+        endpoint: model.endpoint || model.azure_endpoint || '',
+        api_version: model.api_version || '',
+        api_key_env: model.api_key_env || '',
+        base_url: model.base_url || '',
         description: model.description || '',
         context_window: model.context_window || 128000,
         max_output: model.max_output || 16384,
@@ -761,6 +826,15 @@ function ModelForm({ model, isNew, onSave, onCancel }) {
                     required
                 />
             </div>
+            <div className="form-group">
+                <label>Provider Model Name</label>
+                <input
+                    type="text"
+                    value={formData.model}
+                    onChange={(e) => setFormData({ ...formData, model: e.target.value })}
+                    placeholder="e.g., gpt-4.1"
+                />
+            </div>
             <div className="form-row">
                 <div className="form-group">
                     <label>Provider</label>
@@ -779,8 +853,48 @@ function ModelForm({ model, isNew, onSave, onCancel }) {
                     <input
                         type="text"
                         value={formData.deployment}
-                        onChange={(e) => setFormData({ ...formData, deployment: e.target.value })}
+                        onChange={(e) => setFormData({ ...formData, deployment: e.target.value, azure_deployment: e.target.value })}
                         placeholder="Azure deployment name"
+                    />
+                </div>
+            </div>
+            <div className="form-row">
+                <div className="form-group">
+                    <label>Endpoint</label>
+                    <input
+                        type="text"
+                        value={formData.endpoint}
+                        onChange={(e) => setFormData({ ...formData, endpoint: e.target.value })}
+                        placeholder="https://resource.openai.azure.com"
+                    />
+                </div>
+                <div className="form-group">
+                    <label>API Version</label>
+                    <input
+                        type="text"
+                        value={formData.api_version}
+                        onChange={(e) => setFormData({ ...formData, api_version: e.target.value })}
+                        placeholder="2024-10-21"
+                    />
+                </div>
+            </div>
+            <div className="form-row">
+                <div className="form-group">
+                    <label>API Key Env Var</label>
+                    <input
+                        type="text"
+                        value={formData.api_key_env}
+                        onChange={(e) => setFormData({ ...formData, api_key_env: e.target.value })}
+                        placeholder="AZURE_OPENAI_API_KEY"
+                    />
+                </div>
+                <div className="form-group">
+                    <label>Base URL</label>
+                    <input
+                        type="text"
+                        value={formData.base_url}
+                        onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                        placeholder="For OpenAI-compatible providers"
                     />
                 </div>
             </div>

@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 async def create_main_agent(
     *,
     llm: BaseChatModel,
+    fallback_llm: BaseChatModel | None = None,
     context_schema: type | None = None,
     database_url: str | None = None,
     store: BaseStore | None = None,
@@ -48,6 +49,7 @@ async def create_main_agent(
         middlewares, mcp_extra_tools = create_middlewares(
             backend_factory=backend_factory,
             llm=llm,
+            fallback_llm=fallback_llm,
             store=store,
         )
 

@@ -11,6 +11,8 @@ from app.settings import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+DISABLED_ACCOUNT_MESSAGE = "Your account has been disabled. Please contact an administrator."
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -34,7 +36,7 @@ def get_public_config():
     """Get public app configuration (no auth required)."""
     return PublicConfig(
         pending_user_expire_days=settings.PENDING_USER_EXPIRE_DAYS,
-        require_approval=settings.REQUIRE_APPROVAL,
+        require_approval=True,
     )
 
 
@@ -45,7 +47,13 @@ def register(user: UserCreate, db: Session = Depends(database.get_db)):
         raise HTTPException(status_code=400, detail="Username already registered")
     
     hashed_password = auth.get_password_hash(user.password)
-    new_user = models.User(username=user.username, hashed_password=hashed_password)
+    new_user = models.User(
+        username=user.username,
+        hashed_password=hashed_password,
+        role="pending",
+        is_approved=False,
+        token_quota=settings.DEFAULT_TOKEN_QUOTA,
+    )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -63,6 +71,8 @@ def login(user: UserCreate, db: Session = Depends(database.get_db)):
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if not db_user or not auth.verify_password(user.password, db_user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if db_user.role == "disabled":
+        raise HTTPException(status_code=403, detail=DISABLED_ACCOUNT_MESSAGE)
     
     access_token = auth.create_access_token(
         data={"sub": db_user.username, "role": db_user.role},
@@ -92,6 +102,8 @@ def token(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if db_user.role == "disabled":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=DISABLED_ACCOUNT_MESSAGE)
 
     access_token = auth.create_access_token(
         data={"sub": db_user.username, "role": db_user.role},
@@ -119,6 +131,8 @@ def refresh(req: RefreshRequest, db: Session = Depends(database.get_db)):
     db_user = db.query(models.User).filter(models.User.username == username).first()
     if db_user is None:
         raise credentials_exception
+    if db_user.role == "disabled":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=DISABLED_ACCOUNT_MESSAGE)
         
     access_token = auth.create_access_token(
         data={"sub": db_user.username, "role": db_user.role},

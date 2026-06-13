@@ -73,9 +73,6 @@ class Settings(BaseModel):
     # Default token quota for new users (per month). -1 = unlimited
     DEFAULT_TOKEN_QUOTA: int = int(_env("DEFAULT_TOKEN_QUOTA", "100000"))
     
-    # Whether new user registrations require admin approval
-    REQUIRE_APPROVAL: bool = _env("REQUIRE_APPROVAL", "false").lower() == "true"
-    
     # Days before pending user registrations are auto-rejected (0 = never auto-reject)
     PENDING_USER_EXPIRE_DAYS: int = int(_env("PENDING_USER_EXPIRE_DAYS", "7"))
 

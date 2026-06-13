@@ -216,8 +216,7 @@
   align-items: center;
   justify-content: center;
   gap: 8px;
-  width: calc(100% - 32px);
-  margin: 0 16px;
+  width: 100%;
   padding: 10px 12px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border-glass);
@@ -531,6 +530,8 @@
 
 .message-wrapper.assistant {
   justify-content: flex-start;
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .message-bubble {
@@ -1627,11 +1628,17 @@ body.light-theme .hitl-args {
 .token-info {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
   padding: 6px 10px;
   font-size: 11px;
+  max-width: 100%;
+}
+
+.message-wrapper.assistant .agent-turn + .token-info {
+  margin-left: 32px;
 }
 
 .model-badge {
@@ -2084,6 +2091,10 @@ body.light-theme .hitl-args {
   gap: 10px;
 }
 
+.pending-table {
+  border-radius: 8px;
+}
+
 .pending-card {
   display: flex;
   justify-content: space-between;
@@ -2245,6 +2256,11 @@ body.light-theme .hitl-args {
 .status-badge.pending {
   background: rgba(234, 179, 8, 0.15);
   color: #eab308;
+}
+
+.status-badge.disabled {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
 }
 
 .quota-edit {

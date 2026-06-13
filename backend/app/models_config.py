@@ -11,6 +11,7 @@ Reads models.yaml on startup and provides helpers for:
 """
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from pydantic import BaseModel, Field
 from app.logger import get_logger
 
 logger = get_logger(__name__)
+_ENV_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 # Path to models config file
 MODELS_CONFIG_PATH = Path(__file__).parent / "models.yaml"
@@ -38,7 +40,13 @@ class ModelInfo(BaseModel):
     id: str
     name: str
     provider: str
+    model: str | None = None
     deployment: str | None = None
+    azure_deployment: str | None = None
+    endpoint: str | None = None
+    base_url: str | None = None
+    api_version: str | None = None
+    api_key_env: str | None = None
     description: str = ""
     context_window: int = 128000
     max_output: int = 16384
@@ -133,7 +141,13 @@ def get_model_info(model_id: str) -> ModelInfo | None:
         id=model_id,
         name=m.get("name", model_id),
         provider=m.get("provider", "unknown"),
+        model=m.get("model") or m.get("model_name"),
         deployment=m.get("deployment"),
+        azure_deployment=m.get("azure_deployment") or m.get("deployment"),
+        endpoint=m.get("endpoint") or m.get("azure_endpoint"),
+        base_url=m.get("base_url"),
+        api_version=m.get("api_version"),
+        api_key_env=m.get("api_key_env"),
         description=m.get("description", ""),
         context_window=m.get("context_window", 128000),
         max_output=m.get("max_output", 16384),
@@ -158,7 +172,13 @@ def list_models(include_disabled: bool = False) -> list[ModelInfo]:
             id=model_id,
             name=m.get("name", model_id),
             provider=m.get("provider", "unknown"),
+            model=m.get("model") or m.get("model_name"),
             deployment=m.get("deployment"),
+            azure_deployment=m.get("azure_deployment") or m.get("deployment"),
+            endpoint=m.get("endpoint") or m.get("azure_endpoint"),
+            base_url=m.get("base_url"),
+            api_version=m.get("api_version"),
+            api_key_env=m.get("api_key_env"),
             description=m.get("description", ""),
             context_window=m.get("context_window", 128000),
             max_output=m.get("max_output", 16384),
@@ -179,3 +199,48 @@ def get_deployment_name(model_id: str) -> str:
     if info and info.deployment:
         return info.deployment
     return model_id  # Fallback to model_id as deployment
+
+
+def resolve_model_id(runtime_name: str | None, fallback_id: str) -> str:
+    """Map provider response model/deployment metadata back to a YAML model ID."""
+    if not runtime_name:
+        return fallback_id
+    needle = runtime_name.lower()
+    for model_id, entry in get_config().get("models", {}).items():
+        aliases = {
+            model_id,
+            entry.get("model"),
+            entry.get("model_name"),
+            entry.get("deployment"),
+            entry.get("azure_deployment"),
+        }
+        for alias in aliases:
+            if not alias:
+                continue
+            normalized = str(alias).lower()
+            if needle == normalized or needle.startswith(f"{normalized}-"):
+                return model_id
+    return fallback_id
+
+
+def get_model_entry(model_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    """Return the raw YAML model entry for LLM construction."""
+    config = get_config()
+    resolved_id = model_id or config.get("default_model", "gpt-4.1")
+    entry = dict(config.get("models", {}).get(resolved_id) or {})
+    if not entry:
+        # Backward-compatible fallback for env-only deployments.
+        entry = {
+            "name": resolved_id,
+            "provider": "azure_openai",
+            "model": resolved_id,
+            "deployment": resolved_id,
+            "enabled": True,
+        }
+    for key in ("endpoint", "azure_endpoint", "base_url", "api_key"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            match = _ENV_PATTERN.match(value.strip())
+            if match:
+                entry[key] = os.getenv(match.group(1), "")
+    return resolved_id, entry

@@ -40,6 +40,7 @@ from app.api.routers import chat as chat_router
 from app.api.routers import admin as admin_router
 from app.api.routers import models as models_router
 from app.core import auth as auth_utils
+from app import models_config
 from app.settings import settings
 from app.logger import get_logger
 
@@ -70,10 +71,12 @@ def _ensure_default_admin():
             db.commit()
             logger.info("Default admin user created successfully.")
         else:
-            # Ensure existing admin has admin role
-            if admin.role != "admin":
+            # Ensure the configured administrator always has admin privileges
+            # and unlimited monthly quota.
+            if admin.role != "admin" or not admin.is_approved or admin.token_quota != -1:
                 admin.role = "admin"
                 admin.is_approved = True
+                admin.token_quota = -1
                 db.commit()
                 logger.info("Updated existing user %s to admin role.", settings.ADMIN_USERNAME)
 
@@ -88,6 +91,9 @@ async def lifespan(app: FastAPI):
 
     logger.info("Startup: opening agent persistence + building main agent.")
     async with open_agent_persistence(settings.STORE_DATABASE_URL) as (store, checkpointer):
+        app.state.store = store
+        app.state.checkpointer = checkpointer
+        app.state.agent_cache_lock = asyncio.Lock()
         agent = await create_main_agent(
             llm=get_llm(),
             context_schema=Context,
@@ -95,6 +101,7 @@ async def lifespan(app: FastAPI):
             checkpointer=checkpointer,
         )
         app.state.agent = agent
+        app.state.agent_cache = {models_config.get_default_model(): agent}
         logger.info("Startup complete. Main agent ready.")
         yield
         logger.info("Shutdown: closing agent persistence.")
