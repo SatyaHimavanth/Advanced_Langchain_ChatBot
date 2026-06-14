@@ -14,7 +14,7 @@ Chat *display* data lives here (conversations + messages). The agent itself
 tracks state separately via thread_id + AsyncPostgresStore/Saver.
 """
 
-from sqlalchemy import Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, JSON, Boolean, Index
+from sqlalchemy import Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, JSON, Boolean, Index, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 import uuid
@@ -67,7 +67,7 @@ class TokenUsage(Base):
     """
     __tablename__ = "app_token_usage"
     __table_args__ = (
-        Index("ix_app_token_usage_user_month", "user_id", "year", "month"),
+        UniqueConstraint("user_id", "year", "month", name="uq_app_token_usage_user_month"),
     )
 
     id = Column(Integer, primary_key=True, index=True)

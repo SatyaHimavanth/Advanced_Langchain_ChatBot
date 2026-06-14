@@ -56,13 +56,17 @@ class Settings(BaseModel):
         "http://localhost:5173",
     ]
 
+    # ── Host command execution sandboxing / watcher settings ──────────────────
+    ENABLE_HOST_EXECUTION: bool = _env("ENABLE_HOST_EXECUTION", "True").lower() == "true"
+    SKILLS_WATCH: bool = _env("SKILLS_WATCH", "False").lower() == "true"
+
     # ── App auth (FastAPI JWT for the chat backend itself) ──────────────────
     JWT_SECRET_KEY: str = _env(
         "JWT_SECRET_KEY",
         "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7",
     )
     JWT_ALGORITHM: str = _env("JWT_ALGORITHM", "HS256")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(_env("ACCESS_TOKEN_EXPIRE_MINUTES", "1"))
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(_env("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
     REFRESH_TOKEN_EXPIRE_DAYS: int = int(_env("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
     # ── Admin configuration ─────────────────────────────────────────────────

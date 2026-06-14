@@ -67,6 +67,7 @@ def _skills_dirs(rt) -> list:
     tenant_id = c.get("tenant_id", "default")
     user_id   = c.get("user_id", "")
     dirs = [
+        Path(settings.SKILLS_DIR),
         WORKSPACE_ROOT / "tenants" / tenant_id / ".skills",
     ]
     if user_id:
@@ -188,7 +189,7 @@ def create_middlewares(
         ),
 
         # ── Skills ───────────────────────────────────────────────────────
-        SkillsMiddleware(skills_dir=_skills_dirs),
+        SkillsMiddleware(skills_dir=_skills_dirs, watch=settings.SKILLS_WATCH),
 
         # ── MCP Prompt Catalog ──────────────────────────────────────────
         # Lists prompts from connected MCP servers in the system prompt and

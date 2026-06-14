@@ -13,6 +13,7 @@ Mapping:
     user_id    = str(current_user.id)         → workspace + memory namespace
 """
 
+import asyncio
 import shutil
 import subprocess
 import sys
@@ -262,7 +263,7 @@ async def chat(
     # (reasoning, tool calls + results, shell, todos, subagents); ``text`` holds
     # the final agent answer shown expanded; ``files`` holds generated artifacts.
     # ``token_usage`` contains the accumulated token counts for the turn.
-    def on_complete(
+    async def on_complete(
         text: str,
         blocks: list | None = None,
         files: list | None = None,
@@ -280,64 +281,73 @@ async def chat(
         used_model_id = models_config.resolve_model_id(model_name, model_id)
         is_free_model = models_config.is_free_model(used_model_id)
         
-        with SessionLocal() as session:
-            # Save the assistant message with token data
-            session.add(
-                models.ChatMessage(
-                    history_id=history_id,
-                    role="assistant",
-                    text=text or "",
-                    blocks=blocks or None,
-                    attachments=files or None,
-                    model_name=model_name,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    total_tokens=total_tokens,
-                )
-            )
-            session.query(models.ChatHistory).filter(
-                models.ChatHistory.id == history_id
-            ).update({"updated_at": func.now()})
-            
-            # Update user's quota (only for non-free models)
-            if not is_free_model and total_tokens > 0:
-                session.query(models.User).filter(
-                    models.User.id == user_id
-                ).update({
-                    "tokens_used_this_month": models.User.tokens_used_this_month + total_tokens
-                })
-            
-            # Update TokenUsage tracking table
-            if total_tokens > 0:
-                now = datetime.now(timezone.utc)
-                year, month = now.year, now.month
-                
-                token_record = session.query(models.TokenUsage).filter(
-                    models.TokenUsage.user_id == user_id,
-                    models.TokenUsage.year == year,
-                    models.TokenUsage.month == month,
-                ).first()
-                
-                if token_record:
-                    token_record.input_tokens += input_tokens
-                    token_record.output_tokens += output_tokens
-                    token_record.reasoning_tokens += reasoning_tokens
-                    token_record.total_tokens += total_tokens
-                    token_record.request_count += 1
-                else:
-                    session.add(models.TokenUsage(
-                        user_id=user_id,
-                        year=year,
-                        month=month,
+        def db_work():
+            from sqlalchemy.exc import IntegrityError
+            with SessionLocal() as session:
+                # Save the assistant message with token data
+                session.add(
+                    models.ChatMessage(
+                        history_id=history_id,
+                        role="assistant",
+                        text=text or "",
+                        blocks=blocks or None,
+                        attachments=files or None,
+                        model_name=model_name,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         reasoning_tokens=reasoning_tokens,
                         total_tokens=total_tokens,
-                        request_count=1,
-                    ))
-            
-            session.commit()
+                    )
+                )
+                session.query(models.ChatHistory).filter(
+                    models.ChatHistory.id == history_id
+                ).update({"updated_at": func.now()})
+                
+                # Update user's quota (only for non-free models)
+                if not is_free_model and total_tokens > 0:
+                    session.query(models.User).filter(
+                        models.User.id == user_id
+                    ).update({
+                        "tokens_used_this_month": models.User.tokens_used_this_month + total_tokens
+                    })
+                
+                # Update TokenUsage tracking table
+                if total_tokens > 0:
+                    now = datetime.now(timezone.utc)
+                    year, month = now.year, now.month
+                    
+                    try:
+                        session.add(models.TokenUsage(
+                            user_id=user_id,
+                            year=year,
+                            month=month,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            total_tokens=total_tokens,
+                            request_count=1,
+                        ))
+                        session.commit()
+                    except IntegrityError:
+                        session.rollback()
+                        # Record already exists (concurrency collision), fetch and update it
+                        token_record = session.query(models.TokenUsage).filter(
+                            models.TokenUsage.user_id == user_id,
+                            models.TokenUsage.year == year,
+                            models.TokenUsage.month == month,
+                        ).first()
+                        if token_record:
+                            token_record.input_tokens += input_tokens
+                            token_record.output_tokens += output_tokens
+                            token_record.reasoning_tokens += reasoning_tokens
+                            token_record.total_tokens += total_tokens
+                            token_record.request_count += 1
+                        session.commit()
+                else:
+                    session.commit()
+        
+        # Offload sync database work to thread pool
+        await asyncio.to_thread(db_work)
 
     return StreamingResponse(
         stream_agent_sse(
@@ -522,7 +532,7 @@ _RUN_TIMEOUT = 30  # seconds
 
 
 @router.post("/{history_id}/run")
-def run_file(
+async def run_file(
     history_id: int,
     req: RunRequest,
     db: Session = Depends(database.get_db),
@@ -533,6 +543,12 @@ def run_file(
     output. Runs with a timeout, in the file's own thread directory, using an
     interpreter chosen by extension (.py/.js/.sh).
     """
+    if not settings.ENABLE_HOST_EXECUTION:
+        raise HTTPException(
+            status_code=403,
+            detail="Host code execution is disabled."
+        )
+
     history = (
         db.query(models.ChatHistory)
         .filter(
@@ -556,26 +572,36 @@ def run_file(
         )
 
     try:
-        proc = subprocess.run(
-            [*interp, target.name],
+        proc = await asyncio.create_subprocess_exec(
+            *interp,
+            target.name,
             cwd=str(target.parent),
-            capture_output=True,
-            text=True,
-            timeout=_RUN_TIMEOUT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        return {
-            "stdout": proc.stdout[-20000:],
-            "stderr": proc.stderr[-20000:],
-            "exit_code": proc.returncode,
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
-            "stderr": (exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "",
-            "exit_code": None,
-            "timed_out": True,
-        }
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=_RUN_TIMEOUT
+            )
+            return {
+                "stdout": stdout.decode("utf-8", errors="replace")[-20000:],
+                "stderr": stderr.decode("utf-8", errors="replace")[-20000:],
+                "exit_code": proc.returncode,
+                "timed_out": False,
+            }
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            stdout, stderr = await proc.communicate()
+            return {
+                "stdout": stdout.decode("utf-8", errors="replace")[-20000:],
+                "stderr": stderr.decode("utf-8", errors="replace")[-20000:],
+                "exit_code": None,
+                "timed_out": True,
+            }
     except Exception as exc:
         logger.exception("run_file failed for history %s path %s", history_id, req.path)
         raise HTTPException(status_code=500, detail=str(exc))
