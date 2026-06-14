@@ -6,7 +6,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.store.base import BaseStore
 
 from app.agents.main_agent.middlewares import create_middlewares
-from app.agents.main_agent.prompts import SYSTEM_PROMPT
+from app.agents.main_agent.prompts import FILESYSTEM_PROMPT, SYSTEM_PROMPT
 from app.agents.main_agent.tools import tools
 from app.agents.shared.backend import create_backend
 from app.agents.shared.memory import create_memory_store

@@ -78,6 +78,43 @@ from pathlib import Path
 from typing import Any, Callable
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
+
+# ── Runtime config extraction ─────────────────────────────────────────────────
+# Newer langgraph versions no longer expose `.config` on the Runtime object.
+# Copied from user_scoped_workspace.py — kept local to avoid a cross-dependency.
+_get_config_impl: Any = None
+for _mod, _fn in [
+    ("langgraph.config", "get_config"),
+    ("langgraph.pregel", "get_config"),
+    ("langgraph.runtime", "get_config"),
+]:
+    try:
+        import importlib as _il
+        _get_config_impl = getattr(_il.import_module(_mod), _fn)
+        break
+    except (ImportError, AttributeError):
+        continue
+
+
+def _runtime_config(runtime: Any) -> dict:
+    """Return the current invocation config dict, regardless of langgraph version."""
+    cfg = getattr(runtime, "config", None)
+    if isinstance(cfg, dict):
+        return cfg
+    for attr in ("_config", "configurable"):
+        val = getattr(runtime, attr, None)
+        if isinstance(val, dict):
+            return {"configurable": val} if attr == "configurable" else val
+    if _get_config_impl is not None:
+        try:
+            result = _get_config_impl()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+    return {}
 
 logger = logging.getLogger(__name__)
 
@@ -682,7 +719,13 @@ def _mtime_signature(skills_dir: Path) -> str:
 #  PART 8 — SkillsMiddleware
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SkillsDirResolver = str | Path | Callable[[Any], Path]
+_SingleDir = str | Path
+# skills_dir can be:
+#   a single static path, a list of static paths ordered lowest-to-highest
+#   priority, or a callable returning either — same pattern as
+#   UserScopedShellMiddleware. Lists let the middleware merge platform-level,
+#   tenant-level, and user-level skill directories cleanly.
+_SkillsDirResolver = _SingleDir | list[_SingleDir] | Callable[[Any], _SingleDir | list[_SingleDir]]
 
 
 class SkillsMiddleware(AgentMiddleware):
@@ -751,49 +794,126 @@ class SkillsMiddleware(AgentMiddleware):
         # Instance-level cache: resolved_dir_str → _CacheEntry
         self._cache: dict[str, _CacheEntry] = {}
 
+        # ── on-demand skill loader tool ───────────────────────────────────────
+        # The catalog injects name + description only. When a skill is relevant
+        # the agent calls this tool to fetch its full body on demand.
+        #
+        # Path resolution uses RunnableConfig (LangChain injects it; the LLM
+        # never sees it). This is concurrency-safe: every tool call resolves its
+        # own path from its own request config, so concurrent users with
+        # different tenant/user directories cannot interfere with each other.
+        _self = self
+
+        @tool("load_skill")
+        def load_skill(skill_name: str, config: RunnableConfig) -> str:
+            """Load the complete instructions for a named skill.
+
+            The skill catalog in the system prompt lists available skills with
+            short descriptions only. Call this tool when a skill is relevant to
+            the current task and you need its full instructions and reference
+            material before proceeding.
+
+            Args:
+                skill_name: Skill name as shown in the catalog (without the
+                            leading /), e.g. "frontend-design" or "sql-queries".
+            """
+            # config is injected by LangChain — not visible to the LLM.
+            # _resolve_dirs_from_config rebuilds the same ordered dir list that
+            # before_model computed, scoped to this exact user/tenant, with no
+            # shared mutable state between concurrent requests.
+            dirs   = _self._resolve_dirs_from_config(config)
+            skills = _self._get_merged_skills(dirs)
+            match  = next((s for s in skills if s.skill_name == skill_name), None)
+            if match is None:
+                available = ", ".join(s.skill_name for s in skills)
+                return (
+                    f"Skill '{skill_name}' not found. "
+                    f"Available skills: {available}"
+                )
+            return match.render_context_block()
+
+        self.tools = [load_skill]
+
     # ── Skills directory resolution ───────────────────────────────────────────
 
-    def _resolve_dir(self, runtime: Any) -> Path:
-        if callable(self._skills_dir_arg):
-            return Path(self._skills_dir_arg(runtime))
-        return Path(self._skills_dir_arg)
+    def _resolve_dirs(self, runtime: Any) -> list[Path]:
+        """Return ordered skill directories [lowest → highest priority].
 
-    # ── Skills loading with cache ─────────────────────────────────────────────
+        Passes the raw runtime object to the callable. The callable (e.g.
+        _skills_dirs) is responsible for extracting config via _runtime_config,
+        same as every other runtime-aware middleware does.
+        """
+        raw = self._skills_dir_arg(runtime) if callable(self._skills_dir_arg) else self._skills_dir_arg
+        if isinstance(raw, (str, Path)):
+            return [Path(raw)]
+        return [Path(p) for p in raw]
 
-    def _get_skills(
+    def _resolve_dirs_from_config(self, config: RunnableConfig) -> list[Path]:
+        """Same as _resolve_dirs but accepts a RunnableConfig dict (tool path).
+
+        Wraps the config dict in a minimal proxy so _runtime_config inside
+        the callable finds a .config attribute and returns the dict correctly —
+        identical behaviour to the before_model path.
+        """
+        if not callable(self._skills_dir_arg):
+            raw = self._skills_dir_arg
+        else:
+            class _Proxy:
+                def __init__(self, cfg: dict) -> None:
+                    self.config = cfg
+
+            raw = self._skills_dir_arg(_Proxy(config or {}))
+
+        if isinstance(raw, (str, Path)):
+            return [Path(raw)]
+        return [Path(p) for p in raw]
+
+    # ── Skills loading with multi-dir merge + cache ───────────────────────────
+
+    def _get_merged_skills(
         self,
-        skills_dir: Path,
+        dirs: list[Path],
         session_id: str = "",
         effort: str = "medium",
     ) -> list[SkillEntry]:
-        key     = str(skills_dir.resolve())
-        cached  = self._cache.get(key)
-        now     = time.monotonic()
-        sig     = _mtime_signature(skills_dir) if self._watch else ""
+        """Load skills from all dirs and merge: later dirs override earlier ones
+        by skill_name, so user-level skills shadow tenant-level, and tenant
+        shadows platform-level.  Missing directories are silently skipped so
+        new users with empty personal dirs still see platform/tenant skills.
+        """
+        existing_dirs = [d for d in dirs if d.exists()]
+        if not existing_dirs:
+            return []
+
+        cache_key = "|".join(str(d.resolve()) for d in existing_dirs)
+        cached    = self._cache.get(cache_key)
+        now       = time.monotonic()
+        sig       = "|".join(_mtime_signature(d) for d in existing_dirs) if self._watch else ""
 
         if cached is not None:
-            age_ok  = (now - cached.loaded_at) < self._cache_ttl or self._cache_ttl <= 0
+            age_ok   = (now - cached.loaded_at) < self._cache_ttl or self._cache_ttl <= 0
             mtime_ok = (not self._watch) or (cached.mtime_sig == sig)
             if age_ok and mtime_ok:
                 return cached.skills
 
-        skills = _scan_skills(
-            skills_dir,
-            execute_dynamic=self._exec_dynamic,
-            include_supporting_files=self._include_supporting,
-            max_file_kb=self._max_file_kb,
-            max_skill_kb=self._max_skill_kb,
-            include_internal=self._include_internal,
-            session_id=session_id,
-            effort=effort,
-        )
+        # Merge: skill_name → SkillEntry; later (higher-priority) dirs win.
+        merged: dict[str, SkillEntry] = {}
+        for d in existing_dirs:
+            for skill in _scan_skills(
+                d,
+                execute_dynamic=self._exec_dynamic,
+                include_supporting_files=self._include_supporting,
+                max_file_kb=self._max_file_kb,
+                max_skill_kb=self._max_skill_kb,
+                include_internal=self._include_internal,
+                session_id=session_id,
+                effort=effort,
+            ):
+                merged[skill.skill_name] = skill
 
-        self._cache[key] = _CacheEntry(
-            skills=skills,
-            mtime_sig=sig,
-            loaded_at=now,
-        )
-        return skills
+        result = list(merged.values())
+        self._cache[cache_key] = _CacheEntry(skills=result, mtime_sig=sig, loaded_at=now)
+        return result
 
     # ── System prompt builder ─────────────────────────────────────────────────
 
@@ -810,12 +930,16 @@ class SkillsMiddleware(AgentMiddleware):
 
         sections: list[str] = []
 
-        # ── Skill catalog (descriptions — always injected) ────────────────────
+        # ── Skill catalog (name + description only — always injected) ─────────
+        # Full instructions are NOT pre-loaded. When a skill is relevant to the
+        # current task, call the `load_skill` tool to fetch its complete body.
         catalog_lines: list[str] = [
             "## Agent Skills",
             "",
-            "The following skills are available. Skills without *(manual)* "
-            "are considered automatically when relevant to your task.",
+            "The following skills are available. When a skill is relevant to "
+            "your task, call `load_skill(skill_name)` to load its full "
+            "instructions before proceeding. Skills marked *(manual)* must be "
+            "explicitly invoked by the user.",
             "",
         ]
 
@@ -825,43 +949,14 @@ class SkillsMiddleware(AgentMiddleware):
             entry_line = skill.render_catalog_entry()
             if chars_used + len(entry_line) > self._catalog_budget:
                 catalog_lines.append(
-                    f"*… and {len(auto_skills) + len(manual_skills) - catalog_lines.count('- **')} more skills "
-                    f"(catalog budget reached — install fewer skills or increase catalog_budget_chars)*"
+                    f"*… and more skills not shown "
+                    f"(catalog budget reached — increase catalog_budget_chars)*"
                 )
                 break
             catalog_lines.append(entry_line)
             chars_used += len(entry_line) + 1
 
         sections.append("\n".join(catalog_lines))
-
-        # ── Full skill content (auto-invocable skills only) ───────────────────
-        if auto_skills:
-            content_budget = self._content_budget
-            content_parts: list[str] = [
-                "",
-                "---",
-                "## Skill Instructions",
-                "",
-                "The following skills are loaded and active. "
-                "Apply their instructions when relevant.",
-                "",
-            ]
-            budget_used = sum(len(p) + 1 for p in content_parts)
-
-            for skill in auto_skills:
-                block = skill.render_context_block()
-                if budget_used + len(block) > content_budget:
-                    content_parts.append(
-                        f"*… skill `/{skill.skill_name}` and subsequent skills omitted "
-                        f"(content budget reached — increase full_content_budget_chars)*"
-                    )
-                    break
-                content_parts.append(block)
-                content_parts.append("")
-                budget_used += len(block) + 1
-
-            if len(content_parts) > 6:   # at least one skill was added
-                sections.append("\n".join(content_parts))
 
         # ── Manual-invoke note ────────────────────────────────────────────────
         if manual_skills:
@@ -892,18 +987,18 @@ class SkillsMiddleware(AgentMiddleware):
     # async path (astream / ainvoke) ─────────────────────────────────────────
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict | None:
-        """Warm the skills cache at session start."""
-        skills_dir = self._resolve_dir(runtime)
+        """Warm the skills cache at session start for all dirs."""
+        dirs = self._resolve_dirs(runtime)
         session_id, effort = self._get_runtime_info(runtime)
-        self._get_skills(skills_dir, session_id=session_id, effort=effort)
+        self._get_merged_skills(dirs, session_id=session_id, effort=effort)
         return None
 
     async def abefore_model(self, state: Any, runtime: Any) -> dict | None:
-        """Inject skill catalog + full content into system prompt."""
-        skills_dir = self._resolve_dir(runtime)
+        """Inject skill catalog (name + description only) into system prompt."""
+        dirs = self._resolve_dirs(runtime)
         session_id, effort = self._get_runtime_info(runtime)
-        skills    = self._get_skills(skills_dir, session_id=session_id, effort=effort)
-        prompt    = self._build_system_prompt(skills, skills_dir)
+        skills = self._get_merged_skills(dirs, session_id=session_id, effort=effort)
+        prompt = self._build_system_prompt(skills, dirs[0] if dirs else Path("."))
 
         if not prompt:
             return None
@@ -914,16 +1009,16 @@ class SkillsMiddleware(AgentMiddleware):
     # sync path (invoke / stream) ────────────────────────────────────────────
 
     def before_agent(self, state: Any, runtime: Any) -> dict | None:
-        skills_dir = self._resolve_dir(runtime)
+        dirs = self._resolve_dirs(runtime)
         session_id, effort = self._get_runtime_info(runtime)
-        self._get_skills(skills_dir, session_id=session_id, effort=effort)
+        self._get_merged_skills(dirs, session_id=session_id, effort=effort)
         return None
 
     def before_model(self, state: Any, runtime: Any) -> dict | None:
-        skills_dir = self._resolve_dir(runtime)
+        dirs = self._resolve_dirs(runtime)
         session_id, effort = self._get_runtime_info(runtime)
-        skills    = self._get_skills(skills_dir, session_id=session_id, effort=effort)
-        prompt    = self._build_system_prompt(skills, skills_dir)
+        skills = self._get_merged_skills(dirs, session_id=session_id, effort=effort)
+        prompt = self._build_system_prompt(skills, dirs[0] if dirs else Path("."))
 
         if not prompt:
             return None
@@ -934,18 +1029,22 @@ class SkillsMiddleware(AgentMiddleware):
     # ── Convenience ───────────────────────────────────────────────────────────
 
     def list_skills(self, runtime: Any | None = None) -> list[SkillEntry]:
-        """
-        Return currently loaded skills (useful for debugging / inspection).
-        Pass a runtime object to use dynamic path resolution; otherwise the
-        static path is used.
+        """Return currently loaded skills (useful for debugging / inspection).
+
+        Pass a runtime object to use dynamic path resolution. For static paths,
+        runtime can be omitted. For callable skills_dir, runtime is required.
         """
         if runtime is not None:
-            skills_dir = self._resolve_dir(runtime)
+            dirs = self._resolve_dirs(runtime)
         else:
             if callable(self._skills_dir_arg):
-                raise ValueError("Provide a runtime object for dynamic skills_dir.")
-            skills_dir = Path(self._skills_dir_arg)
-        return self._get_skills(skills_dir)
+                raise ValueError(
+                    "skills_dir is a callable — pass a runtime object so the "
+                    "correct tenant/user directories can be resolved."
+                )
+            raw = self._skills_dir_arg
+            dirs = [Path(raw)] if isinstance(raw, (str, Path)) else [Path(p) for p in raw]
+        return self._get_merged_skills(dirs)
 
     def invalidate_cache(self) -> None:
         """Force all cached skills to be re-loaded on the next invocation."""

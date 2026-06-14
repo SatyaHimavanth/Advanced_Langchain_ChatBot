@@ -47,13 +47,31 @@ from app.agents.shared.custom_middlewares.skills_middleware import SkillsMiddlew
 from app.agents.shared.custom_middlewares.user_memory_middleware import UserMemoryMiddleware
 from app.agents.shared.custom_middlewares.mcp_prompt_middleware import MCPPromptMiddleware
 from app.agents.main_agent.subagents import create_subagents
+from app.agents.main_agent.prompts import FILESYSTEM_PROMPT
+from app.agents.shared.custom_middlewares.user_scoped_workspace import _runtime_config
 from app.settings import settings
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 
 WORKSPACE_ROOT = Path(settings.WORKSPACE_ROOT)
-SKILLS_DIR = Path(settings.SKILLS_DIR)
+
+# Skills are resolved at invocation time across three priority levels:
+#   1. platform  — WORKSPACE_ROOT/.skills                      (shared defaults, lowest priority)
+#   2. tenant    — WORKSPACE_ROOT/tenants/{tid}/.skills        (org-level overrides)
+#   3. user      — WORKSPACE_ROOT/users/{tid}/{uid}/.skills    (personal, highest priority)
+# Missing directories are silently skipped, so new users automatically
+# get platform + tenant skills without any provisioning step.
+def _skills_dirs(rt) -> list:
+    c = _runtime_config(rt).get("configurable", {})
+    tenant_id = c.get("tenant_id", "default")
+    user_id   = c.get("user_id", "")
+    dirs = [
+        WORKSPACE_ROOT / "tenants" / tenant_id / ".skills",
+    ]
+    if user_id:
+        dirs.append(WORKSPACE_ROOT / "users" / tenant_id / user_id / ".skills")
+    return dirs
 
 _phone_pattern = re.compile(r"\+?[1-9]\d{7,14}")
 
@@ -131,10 +149,16 @@ def create_middlewares(
                 ),
             ],
         ),
+        # trigger=12k tokens OR 20 messages was too aggressive — the skills
+        # catalog alone costs ~2k tokens of system prompt overhead, leaving
+        # only ~8k of real conversation before summarization fired.
+        # keep must also be LESS than the message trigger, otherwise the
+        # middleware preserves more messages than it needs to condense and
+        # never actually prunes anything.
         SummarizationMiddleware(
             model=llm,
-            trigger=[("tokens", 12_000), ("messages", 20)],
-            keep=("messages", 30),
+            trigger=[("tokens", 24_000), ("messages", 40)],
+            keep=("messages", 10),
         ),
 
         # ── Planning ─────────────────────────────────────────────────────
@@ -160,23 +184,11 @@ def create_middlewares(
         ),
         FilesystemMiddleware(
             backend=backend_factory,
-            system_prompt=(
-                "You have a real workspace on disk — it is your current working "
-                "directory and is shared by the filesystem tools and the shell.\n"
-                "Use PLAIN relative filenames everywhere: write_file('prime.py', "
-                "...), read_file('prime.py'), then run it in the shell with "
-                "`python prime.py`. Do NOT prefix paths with /workspace/ — just "
-                "use the filename (optionally in subfolders, e.g. 'src/app.py').\n"
-                "A file you create with the filesystem tools is the SAME file the "
-                "shell sees, so you can compile/run it immediately to check for "
-                "errors.\n"
-                "Use the /memory/ prefix ONLY for notes that should persist "
-                "across conversations (e.g. write_file('/memory/notes.md', ...))."
-            ),
+            system_prompt=FILESYSTEM_PROMPT,
         ),
 
         # ── Skills ───────────────────────────────────────────────────────
-        SkillsMiddleware(skills_dir=SKILLS_DIR),
+        SkillsMiddleware(skills_dir=_skills_dirs),
 
         # ── MCP Prompt Catalog ──────────────────────────────────────────
         # Lists prompts from connected MCP servers in the system prompt and
