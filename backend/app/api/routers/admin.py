@@ -214,40 +214,52 @@ def list_users(
 ):
     """List all users with pagination and optional filters."""
     query = db.query(models.User)
-    
+
     if role:
         query = query.filter(models.User.role == role)
     if approved is not None:
         query = query.filter(models.User.is_approved == approved)
-    
+
     total = query.count()
     users = query.order_by(desc(models.User.created_at)).offset(offset).limit(limit).all()
-    
-    # Enrich with chat/message counts
-    result = []
-    for user in users:
-        chat_count = db.query(sql_func.count(models.ChatHistory.id)).filter(
-            models.ChatHistory.user_id == user.id
-        ).scalar()
-        message_count = db.query(sql_func.count(models.ChatMessage.id)).join(
-            models.ChatHistory
-        ).filter(models.ChatHistory.user_id == user.id).scalar()
-        
-        user_dict = {
-            "id": user.id,
-            "username": user.username,
-            "role": user.role,
-            "is_approved": user.is_approved,
-            "token_quota": user.token_quota,
-            "tokens_used_this_month": user.tokens_used_this_month,
-            "quota_reset_date": user.quota_reset_date,
-            "created_at": user.created_at,
-            "updated_at": user.updated_at,
-            "chat_count": chat_count,
-            "message_count": message_count,
-        }
-        result.append(UserResponse(**user_dict))
-    
+
+    if not users:
+        return PaginatedResponse(items=[], total=total, offset=offset, limit=limit, has_more=False)
+
+    user_ids = [u.id for u in users]
+
+    # Two aggregate queries instead of 2×N individual ones.
+    chat_counts = dict(
+        db.query(models.ChatHistory.user_id, sql_func.count(models.ChatHistory.id))
+        .filter(models.ChatHistory.user_id.in_(user_ids))
+        .group_by(models.ChatHistory.user_id)
+        .all()
+    )
+    msg_counts = dict(
+        db.query(models.ChatHistory.user_id, sql_func.count(models.ChatMessage.id))
+        .join(models.ChatMessage, models.ChatMessage.history_id == models.ChatHistory.id)
+        .filter(models.ChatHistory.user_id.in_(user_ids))
+        .group_by(models.ChatHistory.user_id)
+        .all()
+    )
+
+    result = [
+        UserResponse(
+            id=u.id,
+            username=u.username,
+            role=u.role,
+            is_approved=u.is_approved,
+            token_quota=u.token_quota,
+            tokens_used_this_month=u.tokens_used_this_month,
+            quota_reset_date=u.quota_reset_date,
+            created_at=u.created_at,
+            updated_at=u.updated_at,
+            chat_count=chat_counts.get(u.id, 0),
+            message_count=msg_counts.get(u.id, 0),
+        )
+        for u in users
+    ]
+
     return PaginatedResponse(
         items=result,
         total=total,
@@ -591,74 +603,107 @@ def get_user_stats(
     db: Session = Depends(database.get_db),
     admin: models.User = Depends(require_admin),
 ):
-    """Get per-user statistics with pagination."""
+    """Get per-user statistics with pagination.
+
+    Uses three aggregate subqueries (chat/message counts, lifetime token totals,
+    current-month token totals) joined to the users table — O(1) queries
+    regardless of user count instead of O(N×4).
+    """
+    from sqlalchemy import case
+
     now = datetime.now(timezone.utc)
     current_year, current_month = now.year, now.month
-    
-    users = db.query(models.User).all()
-    total = len(users)
-    
-    stats = []
-    for user in users:
-        chat_count = db.query(sql_func.count(models.ChatHistory.id)).filter(
-            models.ChatHistory.user_id == user.id
-        ).scalar()
-        
-        message_count = db.query(sql_func.count(models.ChatMessage.id)).join(
-            models.ChatHistory
-        ).filter(models.ChatHistory.user_id == user.id).scalar()
-        
-        # Total tokens from TokenUsage table
-        usage_totals = db.query(
-            sql_func.coalesce(sql_func.sum(models.TokenUsage.input_tokens), 0),
-            sql_func.coalesce(sql_func.sum(models.TokenUsage.output_tokens), 0),
-            sql_func.coalesce(sql_func.sum(models.TokenUsage.reasoning_tokens), 0),
-            sql_func.coalesce(sql_func.sum(models.TokenUsage.total_tokens), 0),
-        ).filter(models.TokenUsage.user_id == user.id).first()
-        
-        # Current month tokens
-        current_month_tokens = db.query(
-            sql_func.coalesce(sql_func.sum(models.TokenUsage.total_tokens), 0)
-        ).filter(
-            models.TokenUsage.user_id == user.id,
-            models.TokenUsage.year == current_year,
-            models.TokenUsage.month == current_month,
-        ).scalar()
-        
-        quota_remaining = -1 if user.token_quota == -1 else max(0, user.token_quota - user.tokens_used_this_month)
-        
-        stats.append(UserStatsResponse(
-            user_id=user.id,
-            username=user.username,
-            role=user.role,
-            chat_count=chat_count,
-            message_count=message_count,
-            total_input_tokens=usage_totals[0] or 0,
-            total_output_tokens=usage_totals[1] or 0,
-            total_reasoning_tokens=usage_totals[2] or 0,
-            total_tokens=usage_totals[3] or 0,
-            current_month_tokens=current_month_tokens or 0,
-            token_quota=user.token_quota,
-            quota_remaining=quota_remaining,
-        ))
-    
-    # Sort
-    if sort_by == "chat_count":
-        stats.sort(key=lambda x: x.chat_count, reverse=True)
-    elif sort_by == "message_count":
-        stats.sort(key=lambda x: x.message_count, reverse=True)
-    else:
-        stats.sort(key=lambda x: x.total_tokens, reverse=True)
-    
-    # Paginate
-    paginated = stats[offset:offset + limit]
-    
+
+    # ── Subquery 1: chat + message counts per user ────────────────────────
+    chat_agg = (
+        db.query(
+            models.ChatHistory.user_id.label("user_id"),
+            sql_func.count(sql_func.distinct(models.ChatHistory.id)).label("chat_count"),
+            sql_func.count(models.ChatMessage.id).label("message_count"),
+        )
+        .outerjoin(models.ChatMessage, models.ChatMessage.history_id == models.ChatHistory.id)
+        .group_by(models.ChatHistory.user_id)
+        .subquery()
+    )
+
+    # ── Subquery 2: lifetime + current-month token totals per user ────────
+    token_agg = (
+        db.query(
+            models.TokenUsage.user_id.label("user_id"),
+            sql_func.coalesce(sql_func.sum(models.TokenUsage.input_tokens), 0).label("total_input"),
+            sql_func.coalesce(sql_func.sum(models.TokenUsage.output_tokens), 0).label("total_output"),
+            sql_func.coalesce(sql_func.sum(models.TokenUsage.reasoning_tokens), 0).label("total_reasoning"),
+            sql_func.coalesce(sql_func.sum(models.TokenUsage.total_tokens), 0).label("total_tokens_all"),
+            sql_func.coalesce(
+                sql_func.sum(
+                    case(
+                        (
+                            (models.TokenUsage.year == current_year) &
+                            (models.TokenUsage.month == current_month),
+                            models.TokenUsage.total_tokens,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("current_month_tokens"),
+        )
+        .group_by(models.TokenUsage.user_id)
+        .subquery()
+    )
+
+    # ── Main query: users LEFT JOIN both subqueries ───────────────────────
+    sort_col = {
+        "chat_count": sql_func.coalesce(chat_agg.c.chat_count, 0),
+        "message_count": sql_func.coalesce(chat_agg.c.message_count, 0),
+    }.get(sort_by, sql_func.coalesce(token_agg.c.total_tokens_all, 0))
+
+    base = (
+        db.query(
+            models.User,
+            sql_func.coalesce(chat_agg.c.chat_count, 0).label("chat_count"),
+            sql_func.coalesce(chat_agg.c.message_count, 0).label("message_count"),
+            sql_func.coalesce(token_agg.c.total_input, 0).label("total_input"),
+            sql_func.coalesce(token_agg.c.total_output, 0).label("total_output"),
+            sql_func.coalesce(token_agg.c.total_reasoning, 0).label("total_reasoning"),
+            sql_func.coalesce(token_agg.c.total_tokens_all, 0).label("total_tokens_all"),
+            sql_func.coalesce(token_agg.c.current_month_tokens, 0).label("current_month_tokens"),
+        )
+        .outerjoin(chat_agg, chat_agg.c.user_id == models.User.id)
+        .outerjoin(token_agg, token_agg.c.user_id == models.User.id)
+        .order_by(desc(sort_col))
+    )
+
+    total = db.query(sql_func.count(models.User.id)).scalar()
+    rows  = base.offset(offset).limit(limit).all()
+
+    stats = [
+        UserStatsResponse(
+            user_id=row.User.id,
+            username=row.User.username,
+            role=row.User.role,
+            chat_count=row.chat_count,
+            message_count=row.message_count,
+            total_input_tokens=row.total_input,
+            total_output_tokens=row.total_output,
+            total_reasoning_tokens=row.total_reasoning,
+            total_tokens=row.total_tokens_all,
+            current_month_tokens=row.current_month_tokens,
+            token_quota=row.User.token_quota,
+            quota_remaining=(
+                -1 if row.User.token_quota == -1
+                else max(0, row.User.token_quota - row.User.tokens_used_this_month)
+            ),
+        )
+        for row in rows
+    ]
+
     return PaginatedResponse(
-        items=paginated,
+        items=stats,
         total=total,
         offset=offset,
         limit=limit,
-        has_more=(offset + len(paginated)) < total,
+        has_more=(offset + len(stats)) < total,
     )
 
 

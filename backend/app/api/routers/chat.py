@@ -70,61 +70,51 @@ async def _get_agent_for_model(request: Request, model_id: str):
         cache = {}
         request.app.state.agent_cache = cache
 
-    cache_key = model_id or None
-    if cache_key in cache:
-        return cache[cache_key]
-
-    default_model_id = models_config.get_default_model()
-    fallback_llm = get_llm(default_model_id) if model_id != default_model_id else None
-
-    async def build_agent(target_model_id: str, target_fallback_llm=None):
-        return await create_main_agent(
-            llm=get_llm(target_model_id),
-            fallback_llm=target_fallback_llm,
-            context_schema=Context,
-            store=getattr(request.app.state, "store", None),
-            checkpointer=getattr(request.app.state, "checkpointer", None),
-        )
-
+    # Always ensure a lock exists. asyncio is single-threaded so this
+    # check-and-set is safe between awaits — no two coroutines can interleave here.
     lock = getattr(request.app.state, "agent_cache_lock", None)
     if lock is None:
-        try:
-            agent = await build_agent(model_id, fallback_llm)
-        except Exception:
-            if model_id == default_model_id:
-                raise
-            logger.exception(
-                "Failed to build selected model '%s'; using default '%s'",
-                model_id,
-                default_model_id,
-            )
-            agent = cache.get(default_model_id)
-            if agent is None:
-                agent = await build_agent(default_model_id)
-                cache[default_model_id] = agent
-            return agent
-        cache[cache_key] = agent
-        return agent
+        lock = asyncio.Lock()
+        request.app.state.agent_cache_lock = lock
+
+    if model_id in cache:
+        return cache[model_id]
 
     async with lock:
-        if cache_key in cache:
-            return cache[cache_key]
+        # Double-check inside the lock: another coroutine may have built it
+        # while we were waiting.
+        if model_id in cache:
+            return cache[model_id]
+
+        default_model_id = models_config.get_default_model()
+        fallback_llm = get_llm(default_model_id) if model_id != default_model_id else None
+
         try:
-            agent = await build_agent(model_id, fallback_llm)
+            agent = await create_main_agent(
+                llm=get_llm(model_id),
+                fallback_llm=fallback_llm,
+                context_schema=Context,
+                store=getattr(request.app.state, "store", None),
+                checkpointer=getattr(request.app.state, "checkpointer", None),
+            )
         except Exception:
             if model_id == default_model_id:
                 raise
             logger.exception(
-                "Failed to build selected model '%s'; using default '%s'",
-                model_id,
-                default_model_id,
+                "Failed to build selected model '%s'; falling back to default '%s'",
+                model_id, default_model_id,
             )
-            agent = cache.get(default_model_id)
-            if agent is None:
-                agent = await build_agent(default_model_id)
-                cache[default_model_id] = agent
-            return agent
-        cache[cache_key] = agent
+            if default_model_id not in cache:
+                cache[default_model_id] = await create_main_agent(
+                    llm=get_llm(default_model_id),
+                    fallback_llm=None,
+                    context_schema=Context,
+                    store=getattr(request.app.state, "store", None),
+                    checkpointer=getattr(request.app.state, "checkpointer", None),
+                )
+            return cache[default_model_id]
+
+        cache[model_id] = agent
         return agent
 
 

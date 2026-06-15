@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import jwt
 
 from app.db import database, models
@@ -14,8 +14,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 DISABLED_ACCOUNT_MESSAGE = "Your account has been disabled. Please contact an administrator."
 
 class UserCreate(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8)
 
 class Token(BaseModel):
     access_token: str

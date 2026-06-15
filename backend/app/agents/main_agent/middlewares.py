@@ -67,7 +67,6 @@ def _skills_dirs(rt) -> list:
     tenant_id = c.get("tenant_id", "default")
     user_id   = c.get("user_id", "")
     dirs = [
-        Path(settings.SKILLS_DIR),
         WORKSPACE_ROOT / "tenants" / tenant_id / ".skills",
     ]
     if user_id:

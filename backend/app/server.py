@@ -8,7 +8,7 @@ On startup (lifespan):
      app_chat_messages).
   2. Open the agent persistence layer (AsyncPostgresStore + checkpointer) and
      keep the connection pools open for the app's lifetime.
-  3. Build the main canvas/coding agent once and stash it on app.state.agent.
+  3. Build the main canvas/coding agent and stash it in app.state.agent_cache.
 
 Routers: auth, history (chat list/CRUD), chat (streaming).
 """
@@ -100,7 +100,6 @@ async def lifespan(app: FastAPI):
             store=store,
             checkpointer=checkpointer,
         )
-        app.state.agent = agent
         app.state.agent_cache = {models_config.get_default_model(): agent}
         logger.info("Startup complete. Main agent ready.")
         yield
