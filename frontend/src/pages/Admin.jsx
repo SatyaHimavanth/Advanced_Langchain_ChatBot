@@ -75,13 +75,18 @@ function Admin() {
     // Users Management
     // ═══════════════════════════════════════════════════════════════════════════════
     
-    const fetchUsers = async (offset = 0, reset = false) => {
+    const fetchUsers = async (offset = 0, reset = false, filterOverride) => {
+        // filterOverride lets callers pass the new filter value immediately
+        // rather than waiting for the setUserFilter setState to flush.
+        // Without it, calling fetchUsers right after setUserFilter reads the
+        // old closure value — the filter doesn't apply until the next render.
+        const activeFilter = filterOverride !== undefined ? filterOverride : userFilter;
         setLoading(true);
         try {
             const params = new URLSearchParams({ offset, limit: 20 });
-            if (userFilter === 'pending') params.append('role', 'pending');
-            if (userFilter === 'approved') params.append('approved', 'true');
-            
+            if (activeFilter === 'pending') params.append('role', 'pending');
+            if (activeFilter === 'approved') params.append('approved', 'true');
+
             const res = await apiFetch(`/admin/users?${params}`);
             if (res.ok) {
                 const data = await res.json();
@@ -240,6 +245,10 @@ function Admin() {
 
     useEffect(() => {
         if (activeTab === TABS.stats) {
+            // Reset offset and flag synchronously so a "Load More" click
+            // that fires before the fetch completes uses the right position.
+            setStatsOffset(0);
+            setHasMoreStats(true);
             fetchUserStats(0, true);
         }
     }, [sortBy]);

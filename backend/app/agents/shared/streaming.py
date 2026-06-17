@@ -691,6 +691,28 @@ class _EventCollector:
         # last entry is fine, but it carries no user-visible content).
         return final, blocks
 
+    def snapshot(self) -> tuple[str, list[dict], list[dict], dict]:
+        """
+        Return a non-destructive snapshot of the current turn for refresh-safe
+        persistence while the stream is still active.
+        """
+        blocks = list(self.blocks)
+        if self._cur_text is not None and self._cur_text.get("text", "").strip():
+            cur = dict(self._cur_text)
+            cur.pop("_key", None)
+            blocks.append(cur)
+
+        final = self._final_text or ""
+        for i in range(len(blocks) - 1, -1, -1):
+            block = blocks[i]
+            if block.get("type") == "text" and not block.get("is_subagent"):
+                if not final:
+                    final = block.get("text", "")
+                blocks.pop(i)
+                break
+
+        return final, blocks, self.collected_files(), self.get_token_usage()
+
     def get_token_usage(self) -> dict:
         """Return accumulated token usage from all agent_message events."""
         total = self._total_input_tokens + self._total_output_tokens
@@ -774,15 +796,20 @@ async def _agent_generator(
     stream_input: dict | Command,
     config: dict,
     context: Any | None,
+    on_progress: Any | None = None,
     on_complete: Any | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Core generator. Yields SSE-formatted strings.
     Handles both new conversations (dict input) and HITL resumes (Command input).
 
+    If ``on_progress`` is provided it receives
+    ``(final_text, blocks, files, token_usage)`` after each collected event so
+    callers can persist an in-progress assistant turn.
+
     If ``on_complete`` is provided it is called once at the end with the final
-    main-agent assistant text (str). It may be a sync or async callable. Used
-    to persist the assistant message to the application database.
+    ``(final_text, blocks, files, token_usage)`` snapshot. It may be a sync or
+    async callable. Used to persist the completed assistant message.
 
     Stream format: v1 with subgraphs=True + list of modes.
     Each chunk is a 3-tuple: (namespace, mode, data)
@@ -801,7 +828,7 @@ async def _agent_generator(
     tool_buffers: defaultdict = defaultdict(_ToolCallBuffer)
 
     # Collect a structured, storable timeline of the turn for persistence.
-    collector = _EventCollector() if on_complete is not None else None
+    collector = _EventCollector() if (on_complete is not None or on_progress is not None) else None
 
     try:
         async for chunk in agent.astream(
@@ -830,6 +857,10 @@ async def _agent_generator(
                 ):
                     if collector is not None:
                         collector.add(evt_type, evt_data)
+                        if on_progress is not None:
+                            result = on_progress(*collector.snapshot())
+                            if inspect.isawaitable(result):
+                                await result
                     yield _sse(evt_type, evt_data)
 
             # ── State updates: interrupts, middleware, final messages ───────────
@@ -843,6 +874,10 @@ async def _agent_generator(
                     ):
                         if collector is not None:
                             collector.add(evt_type, evt_data)
+                            if on_progress is not None:
+                                result = on_progress(*collector.snapshot())
+                                if inspect.isawaitable(result):
+                                    await result
                         yield _sse(evt_type, evt_data)
 
             # ── Custom middleware / tool events ────────────────────────────────
@@ -851,6 +886,10 @@ async def _agent_generator(
                 for evt_type, evt_data in _handle_custom_chunk(data, namespace):
                     if collector is not None:
                         collector.add(evt_type, evt_data)
+                        if on_progress is not None:
+                            result = on_progress(*collector.snapshot())
+                            if inspect.isawaitable(result):
+                                await result
                     yield _sse(evt_type, evt_data)
 
         # ── Force-flush any tool calls that were never closed by a content chunk
@@ -862,6 +901,10 @@ async def _agent_generator(
             ):
                 if collector is not None:
                     collector.add(evt_type, evt_data)
+                    if on_progress is not None:
+                        result = on_progress(*collector.snapshot())
+                        if inspect.isawaitable(result):
+                            await result
                 yield _sse(evt_type, evt_data)
 
     except Exception as exc:
@@ -945,11 +988,16 @@ async def stream_agent_sse(
     input: dict | Command,
     config: dict,
     context: Any | None = None,
+    on_progress: Any | None = None,
     on_complete: Any | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator yielding SSE strings for a chat turn (new message or
     HITL resume). Pass the result directly to ``StreamingResponse``.
+
+    ``on_progress`` (optional, sync or async) receives the current
+    ``(final_text, blocks, files, token_usage)`` snapshot during streaming so
+    callers can restore in-flight turns after refreshes.
 
     ``on_complete`` (optional, sync or async) is called once at the end with
     ``(final_text, blocks, files, token_usage)`` — the final agent answer, the
@@ -962,6 +1010,7 @@ async def stream_agent_sse(
         stream_input=input,
         config=config,
         context=context,
+        on_progress=on_progress,
         on_complete=on_complete,
     ):
         yield sse

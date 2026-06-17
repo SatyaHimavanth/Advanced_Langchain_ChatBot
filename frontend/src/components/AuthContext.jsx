@@ -4,6 +4,19 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 
 const AuthContext = createContext();
 
+/** Extracts a human-readable message from a FastAPI error response.
+ * Validation errors (422) return detail as an array of objects; other errors
+ * return detail as a plain string. */
+function parseApiError(error, fallback) {
+  if (!error?.detail) return fallback;
+  if (Array.isArray(error.detail)) {
+    return error.detail
+      .map(e => e.msg || e.message || JSON.stringify(e))
+      .join('; ');
+  }
+  return error.detail;
+}
+
 export function AuthProvider({ children }) {
   const [token, setToken] = useState(localStorage.getItem('token'));
   const [refreshToken, setRefreshToken] = useState(localStorage.getItem('refresh_token'));
@@ -35,7 +48,7 @@ export function AuthProvider({ children }) {
     });
     if (!res.ok) {
       const error = await res.json();
-      throw new Error(error.detail || 'Login failed');
+      throw new Error(parseApiError(error, 'Login failed'));
     }
     const data = await res.json();
     setToken(data.access_token);
@@ -50,7 +63,7 @@ export function AuthProvider({ children }) {
     });
     if (!res.ok) {
       const error = await res.json();
-      throw new Error(error.detail || 'Registration failed');
+      throw new Error(parseApiError(error, 'Registration failed'));
     }
     const data = await res.json();
     setToken(data.access_token);
@@ -60,6 +73,8 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     setToken(null);
     setRefreshToken(null);
+    // Clear the persisted chat so the next user's session starts clean.
+    localStorage.removeItem('lastActiveHistory');
   }, []);
 
   const refreshTokens = useCallback(async () => {

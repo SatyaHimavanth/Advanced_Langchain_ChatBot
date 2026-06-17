@@ -202,7 +202,7 @@ def create_middlewares(
         # agent to be built with a checkpointer (it is, in server.py).
         HumanInTheLoopMiddleware(
             interrupt_on={
-                "delete_file": {"allowed_decisions": ["approve", "reject"]},
+                "delete_file": {"allowed_decisions": ["approve", "edit", "reject"]},
             },
         ),
 

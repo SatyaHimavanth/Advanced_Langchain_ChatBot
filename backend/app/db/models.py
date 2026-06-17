@@ -58,6 +58,56 @@ class User(Base):
     token_usage = relationship("TokenUsage", back_populates="user", cascade="all, delete-orphan")
 
 
+class PendingInterrupt(Base):
+    """
+    Persists HITL interrupt state across page refreshes and backend restarts.
+    Written when a stream ends with an active interrupt, cleared on resume.
+    Only one pending interrupt per conversation at a time (unique on history_id).
+    """
+    __tablename__ = "app_pending_interrupts"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    history_id = Column(Integer, ForeignKey("app_chat_histories.id", ondelete="CASCADE"),
+                        unique=True, nullable=False, index=True)
+    payload    = Column(Text, nullable=False)   # JSON — raw interrupt value
+    resumable  = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    history = relationship("ChatHistory")
+
+
+class PendingAssistantTurn(Base):
+    """
+    Persists the latest in-progress assistant turn so the UI can restore it
+    after a refresh or chat switch while streaming is still underway.
+
+    Cleared once the final assistant message is written to app_chat_messages.
+    Only one in-progress turn exists per conversation.
+    """
+    __tablename__ = "app_pending_assistant_turns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    history_id = Column(
+        Integer,
+        ForeignKey("app_chat_histories.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    text = Column(Text, nullable=False, default="")
+    blocks = Column(JSON, nullable=True)
+    attachments = Column(JSON, nullable=True)
+    model_name = Column(String(100), nullable=True)
+    input_tokens = Column(Integer, nullable=True)
+    output_tokens = Column(Integer, nullable=True)
+    reasoning_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+    history = relationship("ChatHistory")
+
+
 class TokenUsage(Base):
     """
     Monthly token usage tracking per user.

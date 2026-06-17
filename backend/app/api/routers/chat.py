@@ -253,91 +253,192 @@ async def chat(
     # (reasoning, tool calls + results, shell, todos, subagents); ``text`` holds
     # the final agent answer shown expanded; ``files`` holds generated artifacts.
     # ``token_usage`` contains the accumulated token counts for the turn.
+    def upsert_pending_turn(
+        text: str = "",
+        blocks: list | None = None,
+        files: list | None = None,
+        token_usage: dict | None = None,
+    ) -> None:
+        with SessionLocal() as session:
+            existing = (
+                session.query(models.PendingAssistantTurn)
+                .filter_by(history_id=history_id)
+                .first()
+            )
+            if existing is None:
+                existing = models.PendingAssistantTurn(history_id=history_id)
+                session.add(existing)
+
+            existing.text = text or ""
+            existing.blocks = blocks or None
+            existing.attachments = files or None
+            existing.model_name = token_usage.get("model_name", model_id) if token_usage else model_id
+            existing.input_tokens = token_usage.get("input_tokens", 0) if token_usage else 0
+            existing.output_tokens = token_usage.get("output_tokens", 0) if token_usage else 0
+            existing.reasoning_tokens = token_usage.get("reasoning_tokens", 0) if token_usage else 0
+            existing.total_tokens = token_usage.get("total_tokens", 0) if token_usage else 0
+            session.commit()
+
+    def clear_pending_turn() -> None:
+        with SessionLocal() as session:
+            existing = (
+                session.query(models.PendingAssistantTurn)
+                .filter_by(history_id=history_id)
+                .first()
+            )
+            if existing is not None:
+                session.delete(existing)
+                session.commit()
+
+    await asyncio.to_thread(upsert_pending_turn)
+
+    progress_write_interval = 0.75
+    last_progress_write_at = 0.0
+
+    async def on_progress(
+        text: str,
+        blocks: list | None = None,
+        files: list | None = None,
+        token_usage: dict | None = None,
+    ) -> None:
+        nonlocal last_progress_write_at
+        if not (text or blocks or files):
+            return
+
+        now = asyncio.get_running_loop().time()
+        if now - last_progress_write_at < progress_write_interval:
+            return
+
+        last_progress_write_at = now
+        await asyncio.to_thread(upsert_pending_turn, text, blocks, files, token_usage)
+
     async def on_complete(
         text: str,
         blocks: list | None = None,
         files: list | None = None,
         token_usage: dict | None = None,
     ) -> None:
-        if not text and not blocks and not files:
-            return
-        
-        # Extract token data
-        input_tokens = token_usage.get("input_tokens", 0) if token_usage else 0
-        output_tokens = token_usage.get("output_tokens", 0) if token_usage else 0
+        has_content = bool(text or blocks or files)
+
+        input_tokens     = token_usage.get("input_tokens", 0)     if token_usage else 0
+        output_tokens    = token_usage.get("output_tokens", 0)    if token_usage else 0
         reasoning_tokens = token_usage.get("reasoning_tokens", 0) if token_usage else 0
-        total_tokens = token_usage.get("total_tokens", 0) if token_usage else 0
-        model_name = token_usage.get("model_name", model_id) if token_usage else model_id
-        used_model_id = models_config.resolve_model_id(model_name, model_id)
-        is_free_model = models_config.is_free_model(used_model_id)
-        
-        def db_work():
-            from sqlalchemy.exc import IntegrityError
-            with SessionLocal() as session:
-                # Save the assistant message with token data
-                session.add(
-                    models.ChatMessage(
-                        history_id=history_id,
-                        role="assistant",
-                        text=text or "",
-                        blocks=blocks or None,
-                        attachments=files or None,
-                        model_name=model_name,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        reasoning_tokens=reasoning_tokens,
-                        total_tokens=total_tokens,
-                    )
-                )
-                session.query(models.ChatHistory).filter(
-                    models.ChatHistory.id == history_id
-                ).update({"updated_at": func.now()})
-                
-                # Update user's quota (only for non-free models)
-                if not is_free_model and total_tokens > 0:
-                    session.query(models.User).filter(
-                        models.User.id == user_id
-                    ).update({
-                        "tokens_used_this_month": models.User.tokens_used_this_month + total_tokens
-                    })
-                
-                # Update TokenUsage tracking table
-                if total_tokens > 0:
-                    now = datetime.now(timezone.utc)
-                    year, month = now.year, now.month
-                    
-                    try:
-                        session.add(models.TokenUsage(
-                            user_id=user_id,
-                            year=year,
-                            month=month,
+        total_tokens     = token_usage.get("total_tokens", 0)     if token_usage else 0
+        model_name       = token_usage.get("model_name", model_id) if token_usage else model_id
+        used_model_id    = models_config.resolve_model_id(model_name, model_id)
+        is_free_model    = models_config.is_free_model(used_model_id)
+
+        # ── Step 1: persist the assistant message ─────────────────────────
+        # This runs first and independently so that interrupt-check failures
+        # (Step 2) can never prevent the message from being saved.
+        if has_content:
+            def save_message():
+                from sqlalchemy import update as sa_update
+                from sqlalchemy.exc import IntegrityError
+                with SessionLocal() as session:
+                    session.add(
+                        models.ChatMessage(
+                            history_id=history_id,
+                            role="assistant",
+                            text=text or "",
+                            blocks=blocks or None,
+                            attachments=files or None,
+                            model_name=model_name,
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             reasoning_tokens=reasoning_tokens,
                             total_tokens=total_tokens,
-                            request_count=1,
-                        ))
-                        session.commit()
-                    except IntegrityError:
-                        session.rollback()
-                        # Record already exists (concurrency collision), fetch and update it
-                        token_record = session.query(models.TokenUsage).filter(
-                            models.TokenUsage.user_id == user_id,
-                            models.TokenUsage.year == year,
-                            models.TokenUsage.month == month,
-                        ).first()
-                        if token_record:
-                            token_record.input_tokens += input_tokens
-                            token_record.output_tokens += output_tokens
-                            token_record.reasoning_tokens += reasoning_tokens
-                            token_record.total_tokens += total_tokens
-                            token_record.request_count += 1
-                        session.commit()
-                else:
+                        )
+                    )
+                    session.query(models.ChatHistory).filter(
+                        models.ChatHistory.id == history_id
+                    ).update({"updated_at": func.now()})
+
+                    if not is_free_model and total_tokens > 0:
+                        session.query(models.User).filter(
+                            models.User.id == user_id
+                        ).update({
+                            "tokens_used_this_month": (
+                                models.User.tokens_used_this_month + total_tokens
+                            )
+                        })
+
+                    if total_tokens > 0:
+                        now = datetime.now(timezone.utc)
+                        year, month = now.year, now.month
+                        try:
+                            session.add(models.TokenUsage(
+                                user_id=user_id,
+                                year=year, month=month,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                reasoning_tokens=reasoning_tokens,
+                                total_tokens=total_tokens,
+                                request_count=1,
+                            ))
+                            session.flush()
+                        except IntegrityError:
+                            session.rollback()
+                            session.execute(
+                                sa_update(models.TokenUsage)
+                                .where(
+                                    models.TokenUsage.user_id == user_id,
+                                    models.TokenUsage.year == year,
+                                    models.TokenUsage.month == month,
+                                )
+                                .values(
+                                    input_tokens=models.TokenUsage.input_tokens + input_tokens,
+                                    output_tokens=models.TokenUsage.output_tokens + output_tokens,
+                                    reasoning_tokens=models.TokenUsage.reasoning_tokens + reasoning_tokens,
+                                    total_tokens=models.TokenUsage.total_tokens + total_tokens,
+                                    request_count=models.TokenUsage.request_count + 1,
+                                )
+                            )
                     session.commit()
-        
-        # Offload sync database work to thread pool
-        await asyncio.to_thread(db_work)
+
+            await asyncio.to_thread(save_message)
+            await asyncio.to_thread(clear_pending_turn)
+        else:
+            await asyncio.to_thread(clear_pending_turn)
+
+        # ── Step 2: persist interrupt state (best-effort) ─────────────────
+        # Runs after the message is safely written. Any failure here is logged
+        # but does NOT raise — streaming.py must not catch this as an
+        # on_complete failure and skip the already-completed save above.
+        try:
+            state = await agent.aget_state(config)
+            interrupt_payload = _extract_interrupt_payload(state)
+        except Exception:
+            logger.exception(
+                "on_complete: failed to query interrupt state for history %s", history_id
+            )
+            return
+
+        def save_interrupt():
+            import json
+            with SessionLocal() as session:
+                existing = (
+                    session.query(models.PendingInterrupt)
+                    .filter_by(history_id=history_id)
+                    .first()
+                )
+                if interrupt_payload:
+                    payload_json = json.dumps(interrupt_payload)
+                    if existing:
+                        existing.payload   = payload_json
+                        existing.resumable = interrupt_payload.get("resumable", True)
+                    else:
+                        session.add(models.PendingInterrupt(
+                            history_id=history_id,
+                            payload=payload_json,
+                            resumable=interrupt_payload.get("resumable", True),
+                        ))
+                else:
+                    if existing:
+                        session.delete(existing)
+                session.commit()
+
+        await asyncio.to_thread(save_interrupt)
 
     return StreamingResponse(
         stream_agent_sse(
@@ -345,6 +446,7 @@ async def chat(
             input=agent_input,
             config=config,
             context=context,
+            on_progress=on_progress,
             on_complete=on_complete,
         ),
         media_type="text/event-stream",
@@ -380,15 +482,20 @@ def _extract_interrupt_payload(state) -> dict | None:
 @router.get("/{history_id}/pending")
 async def pending_interrupt(
     history_id: int,
-    request: Request,
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
     """
-    Return whether the agent run for this conversation is paused awaiting a
-    human decision, plus the interrupt payload. Lets the UI restore the
-    approval prompt after a page reload or chat switch.
+    Return whether this conversation has a pending HITL interrupt.
+
+    Reads from app_pending_interrupts (written by on_complete, cleared on
+    normal completion or successful resume) rather than the LangGraph
+    checkpointer. This makes it checkpointer-agnostic: works with
+    InMemorySaver, AsyncSqliteSaver, AsyncPostgresSaver, and survives page
+    refreshes and backend restarts regardless of checkpointer type.
     """
+    import json
+
     history = (
         db.query(models.ChatHistory)
         .filter(
@@ -400,28 +507,63 @@ async def pending_interrupt(
     if not history:
         raise HTTPException(status_code=404, detail="Chat history not found")
 
-    agent = getattr(request.app.state, "agent", None)
-    if agent is None:
+    record = (
+        db.query(models.PendingInterrupt)
+        .filter_by(history_id=history_id)
+        .first()
+    )
+    if not record:
         return {"interrupted": False}
-
-    config = {
-        "configurable": {
-            "thread_id": history.thread_id,
-            "user_id": str(current_user.id),
-            "tenant_id": "default",
-        }
-    }
 
     try:
-        state = await agent.aget_state(config)
+        payload = json.loads(record.payload)
     except Exception:
-        logger.exception("pending_interrupt: aget_state failed for history %s", history_id)
+        # Corrupt record — remove it and report clean
+        db.delete(record)
+        db.commit()
         return {"interrupted": False}
 
-    payload = _extract_interrupt_payload(state)
-    if payload is None:
-        return {"interrupted": False}
     return {"interrupted": True, **payload}
+
+
+@router.get("/{history_id}/stream-state")
+async def stream_state(
+    history_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    history = (
+        db.query(models.ChatHistory)
+        .filter(
+            models.ChatHistory.id == history_id,
+            models.ChatHistory.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not history:
+        raise HTTPException(status_code=404, detail="Chat history not found")
+
+    record = (
+        db.query(models.PendingAssistantTurn)
+        .filter_by(history_id=history_id)
+        .first()
+    )
+    if not record:
+        return {"streaming": False}
+
+    return {
+        "streaming": True,
+        "history_id": history_id,
+        "text": record.text or "",
+        "blocks": record.blocks or [],
+        "attachments": record.attachments or [],
+        "model_name": record.model_name,
+        "input_tokens": record.input_tokens or 0,
+        "output_tokens": record.output_tokens or 0,
+        "reasoning_tokens": record.reasoning_tokens or 0,
+        "total_tokens": record.total_tokens or 0,
+        "updated_at": record.updated_at,
+    }
 
 
 # ── File preview / download ────────────────────────────────────────────────

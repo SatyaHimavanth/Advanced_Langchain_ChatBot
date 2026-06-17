@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
     Brain, Terminal, FileText, Search, Wrench, ListChecks,
     Bot, ArrowLeftRight, Layers, RefreshCw, ChevronDown,
-    Check, Circle, CircleDot, Sparkles
+    Check, Circle, CircleDot, Sparkles, BookOpen
 } from 'lucide-react';
 import { renderMarkdown } from '../lib/markdown';
 import AttachmentList from './AttachmentList';
@@ -65,6 +65,22 @@ function Block({ block }) {
                 </StepRow>
             );
         case 'tool_call': {
+            // load_skill is internal skill-loading machinery introduced by
+            // SkillsMiddleware. Show a concise label and suppress the result
+            // (which is raw skill markdown — not meaningful to display).
+            if (block.tool === 'load_skill') {
+                return (
+                    <StepRow Icon={BookOpen} accent="blue">
+                        <div className={`astep-title${sub}`}>
+                            {block.is_subagent && <span className="sa-tag">subagent</span>}
+                            <span className="astep-strong">Load skill</span>
+                            {block.args?.skill_name && (
+                                <span className="astep-detail"> · {block.args.skill_name}</span>
+                            )}
+                        </div>
+                    </StepRow>
+                );
+            }
             const { Icon, accent } = toolIcon(block.tool);
             return (
                 <StepRow Icon={Icon} accent={accent}>

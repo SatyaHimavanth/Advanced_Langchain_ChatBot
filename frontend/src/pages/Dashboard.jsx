@@ -62,12 +62,20 @@ function DashboardInner() {
     const messagesContainerRef = useRef(null);
     const historyListRef = useRef(null);
     const abortRef = useRef(null);
+    const streamRestoreTimerRef = useRef(null);
     const inputRef = useRef(null);
     const modelDropdownRef = useRef(null);
     // Mirror of activeHistory for use inside async stream callbacks (avoids
     // stale closures when the user switches conversations mid-stream).
     const activeHistoryRef = useRef(null);
     useEffect(() => { activeHistoryRef.current = activeHistory; }, [activeHistory]);
+
+    const stopRestoredStreamPolling = useCallback(() => {
+        if (streamRestoreTimerRef.current) {
+            clearTimeout(streamRestoreTimerRef.current);
+            streamRestoreTimerRef.current = null;
+        }
+    }, []);
 
     const getUserInfo = () => {
         if (!token) return { username: 'User', role: 'user' };
@@ -112,6 +120,17 @@ function DashboardInner() {
 
     const scrollToBottom = () => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     useEffect(() => { scrollToBottom(); }, [messages, streamingTurn, pendingInterrupt]);
+
+    // Restore the last viewed chat on page refresh / tab reopen.
+    // loadHistory already calls /chat/{id}/pending, so any in-progress
+    // interrupt is restored automatically as part of this.
+    useEffect(() => {
+        const saved = localStorage.getItem('lastActiveHistory');
+        if (saved) {
+            loadHistory(Number(saved));
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Fetch models on mount
     useEffect(() => {
@@ -189,6 +208,7 @@ function DashboardInner() {
                     if (!inPinned && reset) {
                         setActiveHistory(null);
                         setMessages([]);
+                        localStorage.removeItem('lastActiveHistory');
                     }
                 }
             }
@@ -219,13 +239,86 @@ function DashboardInner() {
     }, [handleHistoryScroll]);
 
     const startNewChat = () => {
+        stopRestoredStreamPolling();
         if (viewMode === 'archived') setViewMode('active');
         setPendingInterrupt(null);
         setActiveHistory(null);
         setMessages([{ role: 'assistant', text: 'How can I help you build today?' }]);
         setMessageOffset(0);
         setHasMoreMessages(false);
+        localStorage.removeItem('lastActiveHistory');
     };
+
+    const restoreStreamingState = useCallback(async (id) => {
+        try {
+            const res = await apiFetch(`/chat/${id}/stream-state`);
+            if (!res.ok) return false;
+
+            const data = await res.json();
+            if (!data.streaming) {
+                if (streamHistoryId === id) {
+                    setStreamingTurn(null);
+                    setStreamHistoryId(null);
+                    setLoading(false);
+                }
+                return false;
+            }
+
+            setStreamHistoryId(id);
+            setLoading(true);
+            setStreamingTurn({
+                blocks: data.blocks || [],
+                finalText: data.text || '',
+                meta: null,
+                error: null,
+                interrupt: null,
+                files: data.attachments || [],
+                model: data.model_name || null,
+                tokens: {
+                    input: data.input_tokens || 0,
+                    output: data.output_tokens || 0,
+                    reasoning: data.reasoning_tokens || 0,
+                    total: data.total_tokens || 0,
+                },
+            });
+
+            stopRestoredStreamPolling();
+            streamRestoreTimerRef.current = setTimeout(async () => {
+                streamRestoreTimerRef.current = null;
+                const stillStreaming = await restoreStreamingState(id);
+                if (!stillStreaming && activeHistoryRef.current === id) {
+                    try {
+                        const historyRes = await apiFetch(`/history/${id}?message_limit=50`);
+                        if (historyRes.ok) {
+                            const historyData = await historyRes.json();
+                            const refreshedMessages = historyData.messages?.items || historyData.messages || [];
+                            setMessages(
+                                refreshedMessages.length > 0
+                                    ? refreshedMessages
+                                    : [{ role: 'assistant', text: 'How can I help you build today?' }]
+                            );
+                            setMessageOffset(refreshedMessages.length);
+                            setHasMoreMessages(historyData.messages?.has_more || false);
+
+                            const pendingRes = await apiFetch(`/chat/${id}/pending`);
+                            if (pendingRes.ok) {
+                                const pendingData = await pendingRes.json();
+                                setPendingInterrupt(
+                                    pendingData.interrupted ? { historyId: id, data: pendingData } : null
+                                );
+                            }
+                        }
+                    } catch {
+                        /* ignore restore refresh failures */
+                    }
+                }
+            }, 900);
+
+            return true;
+        } catch {
+            return false;
+        }
+    }, [apiFetch, stopRestoredStreamPolling, streamHistoryId]);
 
     const loadHistory = async (id) => {
         try {
@@ -233,6 +326,8 @@ function DashboardInner() {
             if (res.ok) {
                 const data = await res.json();
                 setActiveHistory(id);
+                // Persist so the page can restore this chat on refresh / reopen.
+                localStorage.setItem('lastActiveHistory', String(id));
                 const msgs = data.messages?.items || data.messages || [];
                 setMessages(
                     msgs.length > 0
@@ -241,13 +336,14 @@ function DashboardInner() {
                 );
                 setMessageOffset(msgs.length);
                 setHasMoreMessages(data.messages?.has_more || false);
-                
-                // Restore a pending approval prompt if this conversation's agent
-                // run is paused awaiting a human decision (survives reloads /
-                // chat switches). Skip if it's the conversation currently
-                // streaming (no interrupt yet).
+
+                const restoredStream = await restoreStreamingState(id);
+
+                // Restore a pending interrupt if this conversation's agent run is
+                // paused awaiting a human decision (survives reloads / tab reopens /
+                // chat switches). Skip if it's the conversation currently streaming.
                 setPendingInterrupt(null);
-                if (id !== streamHistoryId) {
+                if (!restoredStream) {
                     try {
                         const pres = await apiFetch(`/chat/${id}/pending`);
                         if (pres.ok) {
@@ -257,8 +353,14 @@ function DashboardInner() {
                             }
                         }
                     } catch {
-                        /* ignore — approval restore is best-effort */
+                        /* ignore — interrupt restore is best-effort */
                     }
+                }
+            } else {
+                // History no longer exists — drop the stored reference so we
+                // don't keep trying to restore a deleted conversation.
+                if (localStorage.getItem('lastActiveHistory') === String(id)) {
+                    localStorage.removeItem('lastActiveHistory');
                 }
             }
         } catch (e) {
@@ -266,9 +368,14 @@ function DashboardInner() {
         }
     };
 
-    // Load more messages (older) when scrolling up
-    const loadMoreMessages = async () => {
+    // Load more messages (older) when scrolling up.
+    // Memoized so the scroll handler captures a stable reference.
+    const loadMoreMessages = useCallback(async () => {
         if (!activeHistory || loadingMoreMessages || !hasMoreMessages) return;
+        const container = messagesContainerRef.current;
+        // Save scroll height before prepending so we can restore position
+        // after React re-renders — otherwise the view jumps to the top.
+        const prevScrollHeight = container?.scrollHeight ?? 0;
         setLoadingMoreMessages(true);
         try {
             const res = await apiFetch(`/history/${activeHistory}/messages?offset=${messageOffset}&limit=50`);
@@ -278,23 +385,27 @@ function DashboardInner() {
                 setMessages(prev => [...olderMsgs, ...prev]);
                 setMessageOffset(prev => prev + olderMsgs.length);
                 setHasMoreMessages(data.has_more || false);
+                // Restore scroll after the DOM updates from the prepend
+                requestAnimationFrame(() => {
+                    if (container) {
+                        container.scrollTop = container.scrollHeight - prevScrollHeight;
+                    }
+                });
             }
         } catch (e) {
             console.error(e);
         } finally {
             setLoadingMoreMessages(false);
         }
-    };
+    }, [activeHistory, loadingMoreMessages, hasMoreMessages, messageOffset, apiFetch]);
 
-    // Scroll handler for loading older messages
     const handleMessagesScroll = useCallback(() => {
         const container = messagesContainerRef.current;
         if (!container || loadingMoreMessages || !hasMoreMessages) return;
-        
         if (container.scrollTop < 100) {
             loadMoreMessages();
         }
-    }, [loadingMoreMessages, hasMoreMessages, activeHistory, messageOffset]);
+    }, [loadingMoreMessages, hasMoreMessages, loadMoreMessages]);
 
     useEffect(() => {
         const container = messagesContainerRef.current;
@@ -311,7 +422,11 @@ function DashboardInner() {
             await apiFetch(`/history/${id}`, { method: 'DELETE' });
             setHistories(histories.filter(h => h.id !== id));
             setPinnedChats(prev => Array.isArray(prev) ? prev.filter(h => h.id !== id) : []);
-            if (activeHistory === id) { setActiveHistory(null); setMessages([]); }
+            if (activeHistory === id) {
+                setActiveHistory(null);
+                setMessages([]);
+                localStorage.removeItem('lastActiveHistory');
+            }
         } catch (err) {
             console.error(err);
         }
@@ -342,7 +457,11 @@ function DashboardInner() {
             await apiFetch(`/history/${id}/${action}`, { method: 'PATCH' });
             setHistories(histories.filter(h => h.id !== id));
             setPinnedChats(prev => Array.isArray(prev) ? prev.filter(h => h.id !== id) : []);
-            if (activeHistory === id) { setActiveHistory(null); setMessages([]); }
+            if (activeHistory === id) {
+                setActiveHistory(null);
+                setMessages([]);
+                localStorage.removeItem('lastActiveHistory');
+            }
         } catch (err) {
             console.error(err);
         }
@@ -417,17 +536,15 @@ function DashboardInner() {
 
     /**
      * Stream a chat turn (new message or HITL resume) and fold events into a
-     * live turn, finalizing it into the message list when done. The stream is
-     * bound to a specific conversation so switching chats mid-stream keeps the
-     * output on the originating conversation (and the DB persists it anyway).
+     * live turn, finalizing it into the message list when done. Returns true
+     * on success, false on stream error (so callers can restore state).
      */
     const runStream = async (extraBody) => {
         const startedWithHistory = activeHistory;
+        stopRestoredStreamPolling();
         setLoading(true);
         setPendingInterrupt(null);
         setStreamingTurn({ blocks: [], finalText: '', meta: null, error: null, interrupt: null, tokens: null, model: null });
-        // For an existing conversation we know the id now; for a brand-new chat
-        // it arrives via onHistoryId (response header).
         setStreamHistoryId(startedWithHistory);
 
         const controller = new AbortController();
@@ -435,7 +552,8 @@ function DashboardInner() {
 
         let streamId = startedWithHistory;
         let newHistoryId = null;
-        let tokenData = null;  // To capture token info from the stream
+        let tokenData = null;
+        let streamFailed = false;
         try {
             newHistoryId = await streamChat(
                 apiFetch,
@@ -444,14 +562,9 @@ function DashboardInner() {
                     signal: controller.signal,
                     onEvent: (evt) => {
                         setStreamingTurn(prev => (prev ? reduceEvent(prev, evt) : prev));
-                        // Capture token info from token_usage events (sent at end of stream)
                         if (evt.event === 'token_usage') {
-                            tokenData = {
-                                model: evt.data?.model,
-                                tokens: evt.data?.tokens,
-                            };
+                            tokenData = { model: evt.data?.model, tokens: evt.data?.tokens };
                         }
-                        // Also capture from agent_message events as backup
                         if (evt.event === 'agent_message' && !evt.data?.is_subagent && evt.data?.tokens) {
                             tokenData = {
                                 model: evt.data?.model || tokenData?.model,
@@ -463,31 +576,31 @@ function DashboardInner() {
                         const num = Number(hid);
                         streamId = num;
                         setStreamHistoryId(num);
-                        // Adopt the new conversation id immediately so the user
-                        // who started it sees the stream bound to it, and the
-                        // sidebar can show the activity indicator.
                         if (!startedWithHistory && activeHistoryRef.current === null) {
                             setActiveHistory(num);
                         }
-                        fetchHistories(0, true);
-                        fetchPinnedChats();
+                        // Only refetch history list for brand-new chats — existing
+                        // chats refetch after the stream finishes to avoid flicker.
+                        if (!startedWithHistory) {
+                            fetchHistories(0, true);
+                            fetchPinnedChats();
+                        }
                     },
                 }
             );
         } catch (err) {
             if (err.name !== 'AbortError') {
+                streamFailed = true;
                 setStreamingTurn(prev => ({ ...(prev || { blocks: [], finalText: '' }), error: err.message }));
             }
         } finally {
+            stopRestoredStreamPolling();
             const resolvedHistory = streamId || (newHistoryId ? Number(newHistoryId) : null);
             const stillViewing = activeHistoryRef.current === resolvedHistory;
 
             setStreamingTurn(prev => {
                 if (prev) {
                     const { timeline, final } = splitFinal(prev.blocks, prev.finalText);
-                    // Only fold into the visible message list if the user is
-                    // still on the originating conversation; otherwise it's
-                    // already persisted server-side and will load on return.
                     if (stillViewing && (timeline.length || final || prev.error)) {
                         setMessages(msgs => [
                             ...msgs,
@@ -498,7 +611,6 @@ function DashboardInner() {
                                 attachments: prev.files || null,
                                 historyId: resolvedHistory,
                                 error: prev.error,
-                                // Token info from the stream (use prev.tokens/model from reduceEvent, or tokenData as fallback)
                                 model_name: prev.model || tokenData?.model || null,
                                 input_tokens: prev.tokens?.input || tokenData?.tokens?.input || 0,
                                 output_tokens: prev.tokens?.output || tokenData?.tokens?.output || 0,
@@ -519,8 +631,7 @@ function DashboardInner() {
             abortRef.current = null;
             fetchHistories(0, true);
             fetchPinnedChats();
-            
-            // Refresh quota after a request
+
             try {
                 const qres = await apiFetch('/models/quota');
                 if (qres.ok) {
@@ -533,13 +644,22 @@ function DashboardInner() {
                 }
             } catch { /* ignore */ }
         }
+        return !streamFailed;
     };
 
-    /** Resume a paused (interrupted) run with the user's decision. */
+    /** Resume a paused (interrupted) run with the user's decision.
+     *  Preserves the interrupt state so the user can retry if the stream fails. */
     const resolveInterrupt = async (decision) => {
         if (!pendingInterrupt || loading) return;
-        setPendingInterrupt(null);
-        await runStream({ interrupt_action: { type: decision }, model_id: selectedModel || undefined });
+        const savedInterrupt = pendingInterrupt;
+        const ok = await runStream({
+            interrupt_action: { type: decision },
+            model_id: selectedModel || undefined,
+        });
+        if (!ok) {
+            // Stream failed before connecting — restore so the user can retry.
+            setPendingInterrupt(savedInterrupt);
+        }
     };
 
     const stopStreaming = () => {
@@ -553,6 +673,8 @@ function DashboardInner() {
         document.addEventListener('click', handleClickOutside);
         return () => document.removeEventListener('click', handleClickOutside);
     }, [isProfileOpen]);
+
+    useEffect(() => () => stopRestoredStreamPolling(), [stopRestoredStreamPolling]);
 
     const activeTitle = histories.find(h => h.id === activeHistory)?.title 
         || (Array.isArray(pinnedChats) ? pinnedChats.find(h => h.id === activeHistory)?.title : undefined);
