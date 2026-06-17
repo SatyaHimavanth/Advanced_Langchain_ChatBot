@@ -653,7 +653,7 @@ function DashboardInner() {
         if (!pendingInterrupt || loading) return;
         const savedInterrupt = pendingInterrupt;
         const ok = await runStream({
-            interrupt_action: { type: decision },
+            interrupt_action: typeof decision === 'string' ? { type: decision } : decision,
             model_id: selectedModel || undefined,
         });
         if (!ok) {
@@ -1036,6 +1036,7 @@ function DashboardInner() {
                     {interruptVisible && (
                         <div className="message-wrapper assistant">
                             <InterruptCard
+                                key={`${pendingInterrupt.historyId}-${JSON.stringify(pendingInterrupt.data?.payload ?? pendingInterrupt.data)}`}
                                 interrupt={pendingInterrupt.data}
                                 busy={loading}
                                 onDecide={resolveInterrupt}
